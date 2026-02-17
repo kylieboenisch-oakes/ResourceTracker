@@ -16,7 +16,8 @@ paths <- list(
   gages_rds     = file.path(data_dir, "usgs_gages_sf_app.rds"),
   monthly_flows = file.path(data_dir, "CO_Seasonal_Flow_Summary_Feb2026.csv"), 
   flowlines     = file.path(data_dir, "flowlines_small.rds"),
-  fl_cejst      = file.path(data_dir, "flowlines_cejst_table.rds")
+  fl_cejst      = file.path(data_dir, "flowlines_cejst_table.rds"),
+  tracts_rds    = file.path(data_dir, "tracts_sf_app.rds") 
 )
 
 # Pre-trimmed flowlines (sf, EPSG:4326)
@@ -27,6 +28,9 @@ cejst <- readRDS(paths$cejst_rds)
 
 # Flowline x CEJST table for Equity + Seasonality (no geometry)
 fl_cejst <- readRDS(paths$fl_cejst)
+
+# Tract polygons with CEJST + rurality (for map layer / info panel)
+tracts_sf <- readRDS(paths$tracts_rds)
 
 # --- Constants ---------------------------------------------------------------
 mon_codes    <- sprintf("%02d", 1:12)          # "01"–"12"
@@ -76,16 +80,48 @@ geocoded_dwtp <- readRDS(paths$dwtp_rds)
 wwtp_pts <- readRDS(paths$wwtp_rds)
 
 # --- UI ----------------------------------------------------------------------
-ui <- navbarPage(
-  "ReSource Tracker",
+ui <- tagList(
+  # ---- GLOBAL STYLE: make tract_info wrap nicely -------------------------
+  tags$head(
+    tags$style(HTML("
+      /* Make the tract info panel wrap text instead of overflowing */
+      #tract_info {
+        white-space: pre-wrap;     /* respect line breaks but wrap long lines */
+        word-break: break-word;    /* break long tokens if needed */
+        font-size: 0.9em;          /* slightly smaller text */
+        max-height: 350px;         /* keep it from growing forever */
+        overflow-y: auto;          /* scroll if it gets long */
+      }
+
+      /* On smaller screens, shrink a bit more */
+      @media (max-width: 1200px) {
+        #tract_info {
+          font-size: 0.85em;
+          max-height: 250px;
+        }
+      }
+
+      @media (max-width: 768px) {
+        #tract_info {
+          font-size: 0.8em;
+          max-height: 200px;
+        }
+      }
+    "))
+  ),
   
+  # ========================= NABAR ===========================================
+  navbarPage(
+    "ReSource Tracker",
   # ========================= TAB 1: MAP ======================================
-  tabPanel(
+    tabPanel(
     "Map",
     fluidPage(
       fluidRow(
         column(
           width = 3,
+          # optional: make sidebar scrollable if content gets long
+          style = "max-height: 900px; overflow-y: auto;",
           
           h4("Map Controls"),
           helpText(
@@ -121,7 +157,12 @@ ui <- navbarPage(
             "• % wastewater for the chosen denominator",
             tags$br(), tags$br(),
             "For equity analysis using Climate and Economic Justice Screening Tool (CEJST) indicators, use the 'Equity' tab."
-          )
+          ),
+          
+          tags$hr(),
+          h4("Selected census tract"),
+          tags$small("Click a tract polygon to see tract-level stats for the selected month and denominator."),
+          verbatimTextOutput("tract_info")
         ),
         
         column(
@@ -528,6 +569,7 @@ ui <- navbarPage(
     )
   )
 )
+)
 
 # --- SERVER ------------------------------------------------------------------
 server <- function(input, output, session) {
@@ -540,6 +582,7 @@ server <- function(input, output, session) {
   
   usgs_gages_sf <- readRDS(paths$gages_rds)
   
+  selected_tract_id <- reactiveVal(NULL)
   # Column selector for map: which %WW column to use based on denominator source
   cols_for <- reactive({
     m <- input$month
@@ -584,6 +627,23 @@ server <- function(input, output, session) {
     leaflet::leaflet(options = leaflet::leafletOptions(preferCanvas = TRUE)) %>%
       leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron, group = "Base") %>%
       
+      leaflet::addPolygons(
+        data   = tracts_sf,
+        group  = "Census tracts",
+        layerId = ~GEOID,                 
+        weight = 0.5,
+        color  = "#999999",
+        opacity = 0.7,
+        fillColor   = "#f0f0f0",
+        fillOpacity = 0.2,
+        highlightOptions = leaflet::highlightOptions(
+          weight = 2,
+          color  = "#555555",
+          fillOpacity = 0.35,
+          bringToFront = FALSE           # keep streams/markers on top even when highlighted
+        )
+      ) %>%
+      
       leaflet::addCircleMarkers(
         data  = geocoded_dwtp,
         lng   = ~Longitude, lat = ~Latitude,
@@ -616,6 +676,17 @@ server <- function(input, output, session) {
         lng1 = bb["xmin"], lat1 = bb["ymin"],
         lng2 = bb["xmax"], lat2 = bb["ymax"]
       )
+  })
+  # ---- Track clicks on census tract polygons --------------------------------
+  observeEvent(input$map_shape_click, {
+    click <- input$map_shape_click
+    # For polygons, click$id will be the layerId we set (~GEOID)
+    if (is.null(click$id)) return()
+    
+    # Only respond if the ID matches a tract GEOID
+    if (click$id %in% tracts_sf$GEOID) {
+      selected_tract_id(click$id)
+    }
   })
   
   observeEvent(list(input$src, input$month), {
@@ -916,6 +987,113 @@ server <- function(input, output, session) {
     ) %>% dplyr::arrange(dplyr::desc(med))
     
     list(n = nrow(wide_cc), friedman = fried, pairwise = pw, month_meds = month_meds)
+  })
+  
+  # ---- Selected census tract info panel -------------------------------------
+  output$tract_info <- renderPrint({
+    gid <- selected_tract_id()
+    
+    if (is.null(gid)) {
+      cat("Click a census tract polygon to see tract-level stats.\n")
+      return(invisible(NULL))
+    }
+    
+    row <- tracts_sf[tracts_sf$GEOID == gid, , drop = FALSE]
+    if (nrow(row) == 0) {
+      cat("Selected tract not found in tract dataset.\n")
+      return(invisible(NULL))
+    }
+    
+    # helper: format percentages
+    fmt_pct <- function(x) {
+      if (is.null(x) || is.na(x)) return("NA")
+      val <- as.numeric(x)
+      if (is.na(val)) return("NA")
+      # assume 0–1 → convert to %
+      if (val <= 1) val <- val * 100
+      paste0(round(val, 1), "%")
+    }
+    
+    # ===== BASIC TRACT METADATA =====
+    cat("Census tract:", gid, "\n")
+    
+    if ("rurality" %in% names(row)) {
+      cat("Rurality: ", as.character(row$rurality), "\n", sep = "")
+    }
+    
+    if ("total_pop" %in% names(row)) {
+      cat("Total population: ", row$total_pop, "\n", sep = "")
+    }
+    if ("median_age" %in% names(row)) {
+      cat("Median age: ", round(row$median_age, 1), "\n", sep = "")
+    }
+    if ("pct_people_of_color" %in% names(row)) {
+      cat("People of color: ", fmt_pct(row$pct_people_of_color), "\n", sep = "")
+    }
+    if ("pct_below_poverty" %in% names(row)) {
+      cat("Below poverty line: ", fmt_pct(row$pct_below_poverty), "\n", sep = "")
+    }
+    if ("pct_no_hs_edu" %in% names(row)) {
+      cat("Adults without HS diploma: ", fmt_pct(row$pct_no_hs_edu), "\n", sep = "")
+    }
+    if ("pct_bachelors_plus" %in% names(row)) {
+      cat("Bachelor's degree or higher: ", fmt_pct(row$pct_bachelors_plus), "\n", sep = "")
+    }
+    if ("is_cejst_disadv" %in% names(row)) {
+      cat("CEJST disadvantaged: ",
+          ifelse(row$is_cejst_disadv, "Yes", "No"), "\n", sep = "")
+    }
+    
+    cat("\n")
+    
+    # ===== MEDIAN %WW FOR THIS TRACT, MONTH, DENOMINATOR =====
+    # Use fl_cejst, which has segment-level %WW + GEOID
+    src_now <- input$src %||% "Gage-based"    # Map tab denominator
+    mon_now <- input$month                    # "01".."12"
+    
+    pct_col <- if (identical(src_now, "Gage-based")) {
+      paste0("pct_mean_", mon_now)
+    } else {
+      paste0("pct_mean_", mon_now, "_nhd")
+    }
+    
+    if (!pct_col %in% names(fl_cejst)) {
+      cat("No %WW column found for this month/source (", pct_col, ").\n", sep = "")
+      return(invisible(NULL))
+    }
+    
+    segs <- fl_cejst %>%
+      dplyr::filter(GEOID == gid)
+    
+    if (nrow(segs) == 0) {
+      cat("No stream segments mapped to this tract.\n")
+      return(invisible(NULL))
+    }
+    
+    pct_vals <- suppressWarnings(as.numeric(segs[[pct_col]]))
+    impacted <- is.finite(pct_vals) & !is.na(pct_vals) & pct_vals > 0
+    
+    n_total    <- length(pct_vals)
+    n_impacted <- sum(impacted, na.rm = TRUE)
+    
+    cat("Stream segments in tract (for month ", mon_now, "):\n", sep = "")
+    cat("  Total segments:   ", n_total, "\n", sep = "")
+    cat("  Impacted segments:", n_impacted, " (", 
+        ifelse(n_total > 0, fmt_pct(n_impacted / n_total), "NA"), 
+        " of segments)\n", sep = "")
+    
+    if (n_impacted == 0) {
+      cat("  Median %WW: NA (no impacted segments this month for this denominator)\n")
+      return(invisible(NULL))
+    }
+    
+    med_pct <- stats::median(pct_vals[impacted], na.rm = TRUE)
+    
+    denom_lab <- if (identical(src_now, "Gage-based")) "gage-based" else "NHDPlus-based"
+    
+    cat("  Median %WW among impacted segments (",
+        denom_lab, ", ", month_labels[mon_now], "): ",
+        round(med_pct, 1), "%\n", sep = "")
   })
   
   output$season_stats_text <- renderPrint({

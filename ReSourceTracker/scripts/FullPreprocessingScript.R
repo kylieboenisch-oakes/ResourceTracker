@@ -8,6 +8,7 @@
 #       * wwtp_pts_app.rds
 #       * usgs_gages_sf_app.rds
 #       * cejst_with_rurality.rds (UR10-based)
+#       * tracts_sf_app.rds 
 #       * flowlines_cejst_table.rds
 # ============================================================
 
@@ -745,4 +746,5 @@ cat("Preprocessing complete. Wrote:\n",
     "  - wwtp_pts_app.rds\n",
     "  - usgs_gages_sf_app.rds\n",
     "  - cejst_with_rurality.rds (UR10-based rurality)\n",
+    "  - tracts_sf_app.rds\n",
     "  - flowlines_cejst_table.rds\n")
