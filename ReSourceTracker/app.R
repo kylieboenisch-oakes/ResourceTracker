@@ -1210,7 +1210,11 @@ server <- function(input, output, session) {
       
       df <- tab %>%
         dplyr::select(GEOID, metric_value, rurality) %>%
-        dplyr::filter(is.finite(metric_value), !is.na(rurality))
+        dplyr::filter(
+          is.finite(metric_value),
+          !is.na(rurality),
+          rurality %in% c("Urban", "Rural")   # <--- drop anything weird
+        )
       
       df$var_bin <- factor(df$rurality, levels = c("Urban", "Rural"))
       return(df)
