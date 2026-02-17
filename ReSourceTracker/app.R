@@ -14,7 +14,7 @@ paths <- list(
   cejst_rds     = file.path(data_dir, "cejst_with_rurality.rds"),
   wwtp_rds      = file.path(data_dir, "wwtp_pts_app.rds"),
   gages_rds     = file.path(data_dir, "usgs_gages_sf_app.rds"),
-  monthly_flows = file.path(data_dir, "CO_Seasonal_Flow_Summary_Feb2026.csv"), # no longer used in app
+  monthly_flows = file.path(data_dir, "CO_Seasonal_Flow_Summary_Feb2026.csv"), 
   flowlines     = file.path(data_dir, "flowlines_small.rds"),
   fl_cejst      = file.path(data_dir, "flowlines_cejst_table.rds")
 )
@@ -51,7 +51,7 @@ month_colors <- setNames(
 # Consistent colors for rurality categories (Urban / Rural) 
 rurality_colors <- c(
   "Urban"    = "#1b9e77",
-  "Rural.  " = "#7570b3"
+  "Rural"    = "#7570b3"
 )
 
 theme_app <- function() {
@@ -241,7 +241,7 @@ ui <- navbarPage(
           selectInput(
             "rurality",
             "Rurality category",
-            choices  = c("All", "Urban", "Suburban", "Rural"),
+            choices  = c("All", "Urban", "Rural"),
             selected = "All"
           ),
           
@@ -256,7 +256,7 @@ ui <- navbarPage(
           helpText(
             "Choose a CEJST numeric indicator (binned) or Rurality (categorical).",
             tags$br(), tags$br(),
-            strong("To compare Urban/Suburban/Rural:"),
+            strong("To compare Urban/Rural:"),
             tags$br(),
             HTML("&bull; Set <b>Rurality category</b> to <b>All</b>"),
             tags$br(),
@@ -316,7 +316,7 @@ ui <- navbarPage(
           selectInput(
             "season_rurality",
             "Rurality category",
-            choices  = c("All", "Urban", "Suburban", "Rural"),
+            choices  = c("All", "Urban", "Rural"),
             selected = "All"
           ),
           
@@ -1212,7 +1212,7 @@ server <- function(input, output, session) {
         dplyr::select(GEOID, metric_value, rurality) %>%
         dplyr::filter(is.finite(metric_value), !is.na(rurality))
       
-      df$var_bin <- factor(df$rurality, levels = c("Urban", "Suburban", "Rural"))
+      df$var_bin <- factor(df$rurality, levels = c("Urban", "Rural"))
       return(df)
     }
     
