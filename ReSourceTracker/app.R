@@ -1210,14 +1210,11 @@ server <- function(input, output, session) {
       
       df <- tab %>%
         dplyr::select(GEOID, metric_value, rurality) %>%
-        dplyr::filter(
-          is.finite(metric_value),
-          !is.na(rurality),
-          rurality %in% c("Urban", "Rural")   # <--- drop anything weird
-        )
+        dplyr::filter(is.finite(metric_value), !is.na(rurality))
       
       df$var_bin <- factor(df$rurality, levels = c("Urban", "Rural"))
       return(df)
+      
     }
     
     # --- Numeric CEJST variable path ---

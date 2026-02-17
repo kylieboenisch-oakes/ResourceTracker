@@ -108,7 +108,7 @@ tracts10 <- tracts(state = "08", year = 2010, class = "sf") %>%
 ur10 <- read_csv(paths$ur10, show_col_types = FALSE) %>%
   mutate(
     GEOID10  = sprintf("%011s", as.character(GEOID)),
-    rurality = as.character(rurality)  # your UR10-based labels
+    rurality = as.character(rurality)  # 
   ) %>%
   select(GEOID10, rurality)
 
