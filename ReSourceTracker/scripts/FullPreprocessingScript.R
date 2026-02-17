@@ -96,7 +96,15 @@ cejst <- read_excel(paths$cejst) %>%
     wastewater_pct = `Wastewater discharge (percentile)`,
     low_income     = `Is low income?`
   ) %>%
-  mutate(GEOID = sprintf("%011.0f", GEOID))
+  mutate(
+    GEOID = sprintf("%011.0f", GEOID),
+    status = dplyr::case_when(
+      wastewater_pct > 90 & low_income ~ "Both",
+      wastewater_pct > 90              ~ "High Wastewater",
+      low_income                       ~ "Low Income",
+      TRUE                             ~ NA_character_
+    )
+  )
 
 # 2010 tracts for Colorado
 tracts10 <- tracts(state = "08", year = 2010, class = "sf") %>%
@@ -714,6 +722,13 @@ tracts_sf <- tracts10 %>%
       select(GEOID10, GEOID, everything()),
     by = "GEOID10"
   )
+
+# Save tracts for the app (census polygons + CEJST + rurality + status)
+saveRDS(
+  tracts_sf,
+  file.path(data_dir, "tracts_sf_app.rds")
+)
+message("Saved: data-raw/tracts_sf_app.rds")
 
 # Spatial join flowlines ↔ CEJST tracts
 fl_cejst_sf <- st_join(flow_small, tracts_sf, left = TRUE)
