@@ -119,8 +119,6 @@ ui <- navbarPage(
             "• Selected month wastewater flow (cfs)",
             tags$br(),
             "• % wastewater for the chosen denominator",
-            tags$br(),
-            "• Upstream WWTP contributors and gage info",
             tags$br(), tags$br(),
             "For equity analysis using Climate and Economic Justice Screening Tool (CEJST) indicators, use the 'Equity' tab."
           )
