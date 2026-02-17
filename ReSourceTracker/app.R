@@ -37,18 +37,18 @@ mon_codes    <- sprintf("%02d", 1:12)          # "01"–"12"
 month_labels <- setNames(month.name, mon_codes)  # names "01".."12" → "January"...
 month_colors <- setNames(
   c(
-    "#3B4F8F", # 01 Jan  - deep cool blue
-    "#4B6CB7", # 02 Feb  - cooler blue
-    "#3C9D82", # 03 Mar  - teal (early spring)
-    "#54B887", # 04 Apr  - fresh green
-    "#7BC96F", # 05 May  - brighter green
-    "#F4D35E", # 06 Jun  - soft yellow
-    "#F6B35E", # 07 Jul  - warm golden
-    "#F28E52", # 08 Aug  - orange
-    "#E76F51", # 09 Sep  - reddish orange
-    "#D95F5F", # 10 Oct  - warm red
-    "#A8558C", # 11 Nov  - magenta
-    "#6D4C9B"  # 12 Dec  - cool purple
+    "#3B4F8F", # 01 Jan  
+    "#4B6CB7", # 02 Feb  
+    "#3C9D82", # 03 Mar  
+    "#54B887", # 04 Apr  
+    "#7BC96F", # 05 May  
+    "#F4D35E", # 06 Jun  
+    "#F6B35E", # 07 Jul  
+    "#F28E52", # 08 Aug  
+    "#E76F51", # 09 Sep  
+    "#D95F5F", # 10 Oct  
+    "#A8558C", # 11 Nov  
+    "#6D4C9B"  # 12 Dec 
   ),
   mon_codes
 )
@@ -58,6 +58,7 @@ rurality_colors <- c(
   "Rural"    = "#7570b3"
 )
 
+# Plot theme - consistent
 theme_app <- function() {
   theme_minimal(base_size = 15) +
     theme(
@@ -72,7 +73,6 @@ theme_app <- function() {
 }
 
 # --- Load Datasets -----------------------------------------------------------
-
 # DWTPs
 geocoded_dwtp <- readRDS(paths$dwtp_rds)
 
@@ -81,7 +81,7 @@ wwtp_pts <- readRDS(paths$wwtp_rds)
 
 # --- UI ----------------------------------------------------------------------
 ui <- tagList(
-  # ---- GLOBAL STYLE: make tract_info wrap nicely -------------------------
+  # ---- Global style to allow tract-info to wrap well ------------------------
   tags$head(
     tags$style(HTML("
       /* Make the tract info panel wrap text instead of overflowing */
@@ -110,7 +110,7 @@ ui <- tagList(
     "))
   ),
   
-  # ========================= NABAR ===========================================
+  # ========================= NAVBAR ===========================================
   navbarPage(
     "ReSource Tracker",
   # ========================= TAB 1: MAP ======================================
@@ -120,7 +120,7 @@ ui <- tagList(
       fluidRow(
         column(
           width = 3,
-          # optional: make sidebar scrollable if content gets long
+          #make sidebar scrollable if content gets long
           style = "max-height: 900px; overflow-y: auto;",
           
           h4("Map Controls"),
@@ -299,7 +299,12 @@ ui <- tagList(
             tags$br(),
             HTML("&bull; Set <b>Rurality category</b> to <b>All</b>"),
             tags$br(),
-            HTML("&bull; Set <b>Grouping variable</b> to <b>Rurality</b>")
+            HTML("&bull; Set <b>Grouping variable</b> to <b>Rurality</b>"),
+            tags$br(), tags$br(),
+            HTML(
+              'Definitions of CEJST parameters: ',
+              '<a href="https://public-environmental-data-partners.github.io/j40-cejst-2/en/methodology#3/33.47/-97.5" target="_blank">CEJST methodology &amp; data dictionary</a>.'
+            )
           ),
           
           selectInput(
@@ -574,6 +579,7 @@ ui <- tagList(
 # --- SERVER ------------------------------------------------------------------
 server <- function(input, output, session) {
   
+  # Helper
   `%||%` <- function(a, b) if (!is.null(a)) a else b
   
   # ---- GAGES (markers; monthly stats) ---------------------------------------
@@ -677,6 +683,7 @@ server <- function(input, output, session) {
         lng2 = bb["xmax"], lat2 = bb["ymax"]
       )
   })
+  
   # ---- Track clicks on census tract polygons --------------------------------
   observeEvent(input$map_shape_click, {
     click <- input$map_shape_click
@@ -731,7 +738,6 @@ server <- function(input, output, session) {
       pct_max_col  <- paste0("pct_max_",  m)
       
       dat$popup_tmp <- paste0(
-        "<b>Hydroseq:</b> ", dat$Hydroseq, "<br><br>",
         "<b>", mlab, " WW Flow (mean±sd):</b> ",
         safe_round(dat[[ww_mean_col]]), " cfs",
         " (sd ", safe_round(dat[[sd_col]]),
@@ -755,7 +761,6 @@ server <- function(input, output, session) {
       pct_mean_nhd <- paste0("pct_mean_", m, "_nhd")
       
       dat$popup_tmp <- paste0(
-        "<b>Hydroseq:</b> ", dat$Hydroseq, "<br><br>",
         "<b>", mlab, " NHDPlus flow:</b> ",
         safe_round(dat[[q_nhd_col]]), " cfs<br><br>",
         "<b>", mlab, " % Wastewater (NHDPlus-based):</b><br>",
@@ -763,14 +768,13 @@ server <- function(input, output, session) {
       )
     }
     
-    # --- Strip to just what Leaflet needs (plus geometry) ------------------
+    # --- Strip data to just what Leaflet needs  ------------------------------
     dat_leaf <- dat %>%
       dplyr::select(
         Hydroseq,
         QE_MA,
         ._color,
         popup_tmp
-        # geometry carried automatically by sf
       )
     
     proxy <- leaflet::leafletProxy("map") %>%
@@ -787,7 +791,7 @@ server <- function(input, output, session) {
         group   = "Streams"
       )
     
-    # Continuous legend for %WW colors (still 0–100%)
+    # Continuous legend for %WW colors 
     proxy <- proxy %>%
       leaflet::addLegend(
         position = "bottomright",
@@ -833,7 +837,7 @@ server <- function(input, output, session) {
       )
   })
   
-  # ================= SEASONALITY TAB LOGIC ====================
+  # ================= SEASONALITY TAB LOGIC ===================================
   season_cols_for <- reactive({
     src <- input$season_src %||% "Gage-based"
     list(
@@ -949,7 +953,7 @@ server <- function(input, output, session) {
       ) %>%
       dplyr::mutate(pct = dplyr::if_else(is.finite(pct), pct, NA_real_))
     
-    # ever-impacted membership
+    # ever-impacted 
     ever_imp <- long %>%
       dplyr::group_by(unit_id) %>%
       dplyr::summarise(ever_impacted = any(!is.na(pct) & pct > 0, na.rm = TRUE), .groups = "drop")
@@ -1020,28 +1024,24 @@ server <- function(input, output, session) {
     if ("rurality" %in% names(row)) {
       cat("Rurality: ", as.character(row$rurality), "\n", sep = "")
     }
+    if ("Total population" %in% names(row)) {
+      cat("Total population: ", row$`Total population`, "\n", sep = "")
+    }
+    if ("Percent age over 64" %in% names(row)) {
+      cat("Percent age over 64: ", fmt_pct(row$`Percent age over 64`), "\n", sep = "")
+    }
+    if ("Percent White" %in% names(row)) {
+      cat("Percent White: ", fmt_pct(row$`Percent White`), "\n", sep = "")
+    }
     
-    if ("total_pop" %in% names(row)) {
-      cat("Total population: ", row$total_pop, "\n", sep = "")
-    }
-    if ("median_age" %in% names(row)) {
-      cat("Median age: ", round(row$median_age, 1), "\n", sep = "")
-    }
-    if ("pct_people_of_color" %in% names(row)) {
-      cat("People of color: ", fmt_pct(row$pct_people_of_color), "\n", sep = "")
-    }
-    if ("pct_below_poverty" %in% names(row)) {
-      cat("Below poverty line: ", fmt_pct(row$pct_below_poverty), "\n", sep = "")
-    }
-    if ("pct_no_hs_edu" %in% names(row)) {
-      cat("Adults without HS diploma: ", fmt_pct(row$pct_no_hs_edu), "\n", sep = "")
-    }
-    if ("pct_bachelors_plus" %in% names(row)) {
-      cat("Bachelor's degree or higher: ", fmt_pct(row$pct_bachelors_plus), "\n", sep = "")
-    }
-    if ("is_cejst_disadv" %in% names(row)) {
-      cat("CEJST disadvantaged: ",
-          ifelse(row$is_cejst_disadv, "Yes", "No"), "\n", sep = "")
+    poverty_col <- "Percentage households below 100% of federal poverty line in 2009 (island areas) and 2010 (states and PR)"
+    
+    if (poverty_col %in% names(row)) {
+      cat(
+        "Percentage of households below 100% of federal poverty line in 2010: ",
+        fmt_pct(row[[poverty_col]]), "\n",
+        sep = ""
+      )
     }
     
     cat("\n")
