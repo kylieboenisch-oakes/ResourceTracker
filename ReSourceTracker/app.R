@@ -48,11 +48,10 @@ month_colors <- setNames(
   ),
   mon_codes
 )
-# Consistent colors for rurality categories (Urban / Suburban / Rural)
+# Consistent colors for rurality categories (Urban / Rural) 
 rurality_colors <- c(
   "Urban"    = "#1b9e77",
-  "Suburban" = "#7570b3",
-  "Rural"    = "#d95f02"
+  "Rural.  " = "#7570b3"
 )
 
 theme_app <- function() {

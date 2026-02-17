@@ -5,9 +5,8 @@ library(readxl)
 library(sf)
 library(tigris)
 library(viridisLite)
-# --- Relative Paths ----------------------------------------------------------
-data_dir <- "data-raw"
 
+# --- Relative Paths ----------------------------------------------------------
 paths <- list(
   dwtp          = file.path(data_dir, "filtereddwtpCOFinal.csv"),
   cejst         = file.path(data_dir, "ColoradoCEJSTData.xlsx"),
@@ -15,7 +14,8 @@ paths <- list(
   wwtp          = file.path(data_dir, "PermittedPOTW.xlsx"),
   flowlines     = file.path(data_dir, "Flowlines_Colorado_Filtered.gpkg"),
   monthly_flows = file.path(data_dir, "CO_Seasonal_Flow_Summary_Feb2026.csv"),
-  gages_sf      = file.path(data_dir, "processed_gages_sf_combinedV4.gpkg")
+  gages_sf      = file.path(data_dir, "processed_gages_sf_combinedV4.gpkg"), 
+  ur10          = file.path(data_dir, "CO_2010_URBANRURAL_TRACTS.csv")
 )
 
 # ---- Required file checks ---------------------------------------------------
@@ -29,18 +29,20 @@ check_required_file <- function(path, label, url = NULL) {
       msg <- paste0(
         msg,
         "Download it from:\n  ", url, "\n\n",
-        "Save it at the path above and then rerun.\n"
+        "Save it at the path above and then rerun the app.\n"
       )
     }
     stop(msg, call. = FALSE)
   }
 }
 
+# Flowlines geopackage: too large to store on repo, provided via GitHub release
 check_required_file(
   paths$flowlines,
   "Flowlines_Colorado_Filtered.gpkg",
   "https://github.com/sheldonmasters/Masters-Research-Group/releases/tag/v0.1.0"
 )
+
 
 # --- Constants ---------------------------------------------------------------
 mon_codes    <- sprintf("%02d", 1:12)          
@@ -73,10 +75,10 @@ cejst <- read_excel(paths$cejst) %>%
     )
   )
 
-# ------------------ 2010 TRACTS + DENSITY-BASED RURALITY --------------------
+# ------------------ 2010 TRACTS + UR10-BASED RURALITY -----------------------
 options(tigris_use_cache = TRUE)
 
-# 2010 tracts for Colorado, equal-area CRS for area
+# 2010 tracts for Colorado (geometry + GEOID10 key)
 tracts10 <- tracts(state = "08", year = 2010, class = "sf") %>%
   st_make_valid() %>%
   st_transform(5070) %>%
@@ -84,45 +86,21 @@ tracts10 <- tracts(state = "08", year = 2010, class = "sf") %>%
     GEOID10 = sprintf("%011s", as.character(GEOID10))
   )
 
-# Area per tract (km^2)
-tract_area <- tracts10 %>%
-  mutate(area_km2 = as.numeric(st_area(geometry)) / 1e6) %>%
-  st_drop_geometry() %>%
-  group_by(GEOID10) %>%
-  summarise(
-    area_km2 = sum(area_km2, na.rm = TRUE),
-    .groups  = "drop"
-  )
-
-# CEJST population aligned to GEOID10
-cejst_pop <- cejst %>%
-  mutate(GEOID10 = sprintf("%011s", as.character(GEOID))) %>%
-  select(GEOID10, total_pop = `Total population`)
-
-# Density-based rurality classification
-#   Rural    : pop_km2 <  50
-#   Suburban : 50 ≤ pop_km2 < 1000
-#   Urban    : pop_km2 ≥ 1000
-ru_base <- tract_area %>%
-  left_join(cejst_pop, by = "GEOID10") %>%
+# UR10 rurality table (precomputed)
+ur10 <- readr::read_csv(paths$ur10, show_col_types = FALSE) %>%
   mutate(
-    pop_km2 = ifelse(is.finite(total_pop) & area_km2 > 0, total_pop / area_km2, NA_real_),
-    rurality = case_when(
-      is.finite(pop_km2) & pop_km2 < 50    ~ "Rural",
-      is.finite(pop_km2) & pop_km2 < 1000  ~ "Suburban",
-      is.finite(pop_km2) & pop_km2 >= 1000 ~ "Urban",
-      TRUE                                 ~ NA_character_
-    )
+    GEOID10  = sprintf("%011s", as.character(GEOID)),
+    rurality = as.character(rurality)
   ) %>%
   select(GEOID10, rurality)
 
-# Attach rurality back to CEJST tract table
+# Attach Census-based rurality back to CEJST table
 cejst <- cejst %>%
   mutate(GEOID10 = sprintf("%011s", as.character(GEOID))) %>%
-  left_join(ru_base, by = "GEOID10") %>%
+  left_join(ur10, by = "GEOID10") %>%
   select(-GEOID10)
 
-# 2010 tracts + CEJST (including rurality), in WGS84 for app
+# 2010 tracts + CEJST (including rurality), in WGS84 for the app
 tracts_sf <- tracts10 %>%
   st_transform(4326) %>%
   left_join(
