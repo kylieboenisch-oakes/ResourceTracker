@@ -19,6 +19,9 @@ library(readr)
 library(sf)
 library(tigris)
 library(viridisLite)
+library(here)
+
+setwd("/Users/kylieboenischoakes/Documents/ResourceTracker/ReSourceTracker")
 
 options(tigris_use_cache = TRUE)
 
@@ -748,3 +751,4 @@ cat("Preprocessing complete. Wrote:\n",
     "  - cejst_with_rurality.rds (UR10-based rurality)\n",
     "  - tracts_sf_app.rds\n",
     "  - flowlines_cejst_table.rds\n")
+
