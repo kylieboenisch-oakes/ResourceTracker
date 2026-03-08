@@ -388,9 +388,8 @@ same_seg_ww_adj_seed <- c(
 
 flow_order <- flow_order %>%
   mutate(
-    force_gage   = Hydroseq %in% forced_hseq,
-    needs_ww_adj = Hydroseq %in% same_seg_ww_adj_seed,
-    gage_hseq    = if_else(!is.na(site_no), Hydroseq, NA_character_)
+    force_gage = Hydroseq %in% forced_hseq,
+    gage_hseq  = if_else(!is.na(site_no), Hydroseq, NA_character_)
   )
 
 # Downstream index
@@ -414,6 +413,17 @@ ww_local_wide <- flow_map %>%
 flow_order <- flow_order %>%
   left_join(ww_local_wide, by = "Hydroseq") %>%
   mutate(across(starts_with("WW_mean_"), ~coalesce(as.numeric(.x), 0)))
+
+# Bake local WW into Qgage_prop at same-seg seeds
+for (mm in mon_codes) {
+  mcol     <- paste0("Qgage_", mm, "_prop")
+  ww_col   <- paste0("WW_mean_", mm)
+  seed_idx <- which(flow_order$Hydroseq %in% same_seg_ww_adj_seed)
+  for (i in seed_idx) {
+    ww_val <- coalesce(as.numeric(flow_order[[ww_col]][i]), 0)
+    flow_order[[mcol]][i] <- flow_order[[mcol]][i] + ww_val
+  }
+}
 
 # Propagate downstream
 known   <- which(rowSums(is.finite(as.matrix(flow_order[, paste0("Qgage_", mon_codes)]))) > 0)
@@ -450,7 +460,7 @@ while (length(queue) > 0) {
   
   flow_order$gage_used[j] <- flow_order$gage_used[i]
   if (is.na(flow_order$gage_hseq[j])) flow_order$gage_hseq[j] <- flow_order$gage_hseq[i]
-  flow_order$needs_ww_adj[j] <- flow_order$needs_ww_adj[j] | flow_order$needs_ww_adj[i]
+ 
   
   visited[j] <- TRUE
   queue <- c(queue, j)
@@ -481,7 +491,6 @@ for (hseq in confluence_hseqs) {
       }
       flow_order$gage_used[idx] <- combined_gages
       flow_order$gage_hseq[idx] <- NA_character_
-      flow_order$needs_ww_adj[idx] <- FALSE
       current_hseq <- flow_order$DnHydroseq[idx]
       if (is.na(current_hseq)) break
     }
@@ -511,7 +520,6 @@ flowlines <- flowlines %>%
     flow_order %>%
       select(
         Hydroseq, site_no, gage_used, gage_hseq,
-        needs_ww_adj,
         matches("^QE_\\d{2}_final$"),
         matches("^QE_\\d{2}_low_final$"),
         matches("^QE_\\d{2}_high_final$")
@@ -542,37 +550,10 @@ for (mm in mon_codes) {
   q_low   <- paste0("QE_", mm, "_low_final")
   q_high  <- paste0("QE_", mm, "_high_final")
   
-  pct_mean_col      <- paste0("pct_mean_", mm)
-  pct_min_col       <- paste0("pct_min_",  mm)
-  pct_max_col       <- paste0("pct_max_",  mm)
-  pct_mean_base_col <- paste0("pct_mean_", mm, "_base")
-  
-  WW_seg <- flowlines[[ww_mean]]
-  Q_seg  <- flowlines[[q_mean]]
-  flowlines[[pct_mean_base_col]] <- compute_pct(WW_seg, Q_seg)
-  
-  WW_seg_mean <- flowlines[[ww_mean]]
-  WW_seg_low  <- flowlines[[ww_low]]
-  WW_seg_high <- flowlines[[ww_high]]
-  Q_mean <- flowlines[[q_mean]]
-  Q_low  <- flowlines[[q_low]]
-  Q_high <- flowlines[[q_high]]
-  
-  ww_local_mean <- coalesce(as.numeric(flowlines[[paste0("WW_mean_", mm)]]), 0)
-  ww_local_var  <- coalesce(as.numeric(flowlines[[paste0("WW_var_",  mm)]]), 0)
-  ww_local_sd   <- sqrt(ww_local_var)
-  ww_local_low  <- pmax(ww_local_mean - ww_local_sd, 0)
-  ww_local_high <- ww_local_mean + ww_local_sd
-  
-  use_same_seg <- flowlines$needs_ww_adj == TRUE & !is.na(flowlines[[q_mean]])
-  
-  denom_mean <- case_when(use_same_seg ~ Q_mean + ww_local_mean, TRUE ~ Q_mean)
-  denom_low  <- case_when(use_same_seg ~ Q_low  + ww_local_low,  TRUE ~ Q_low)
-  denom_high <- case_when(use_same_seg ~ Q_high + ww_local_high, TRUE ~ Q_high)
-  
-  flowlines[[pct_mean_col]] <- compute_pct(WW_seg_mean, denom_mean)
-  flowlines[[pct_min_col]]  <- compute_pct(WW_seg_low,  denom_high)
-  flowlines[[pct_max_col]]  <- compute_pct(WW_seg_high, denom_low)
+  flowlines[[paste0("pct_mean_", mm, "_base")]] <- compute_pct(flowlines[[ww_mean]], flowlines[[q_mean]])
+  flowlines[[paste0("pct_mean_", mm)]]          <- compute_pct(flowlines[[ww_mean]], flowlines[[q_mean]])
+  flowlines[[paste0("pct_min_",  mm)]]          <- compute_pct(flowlines[[ww_low]],  flowlines[[q_high]])
+  flowlines[[paste0("pct_max_",  mm)]]          <- compute_pct(flowlines[[ww_high]], flowlines[[q_low]])
   
   q_nhd <- paste0("QE_", mm, "_nhd")
   flowlines[[paste0("pct_mean_", mm, "_nhd")]] <- compute_pct(flowlines[[ww_mean]], flowlines[[q_nhd]])
