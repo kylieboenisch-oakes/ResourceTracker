@@ -202,18 +202,22 @@ dmr_monthly_wide <- dmr_monthly_comid %>%
 
 # 3.4) Map WWTPs to flowlines via nearest COMID (for completeness, if needed)
 wwtp_pts <- st_as_sf(wwtp_df, coords = c("Longitude", "Latitude"), crs = 4326)
-wwtp_pts_proj <- st_transform(wwtp_pts, st_crs(flowlines))
-wwtp_pts_proj$matched_COMID <- flowlines$COMID[st_nearest_feature(wwtp_pts_proj, flowlines)]
+wwtp_pts <- st_transform(wwtp_pts, st_crs(flowlines))
+wwtp_pts$matched_COMID <- flowlines$COMID[st_nearest_feature(wwtp_pts, flowlines)]
 
-# 3.5) Attach COMID-level WW mean/var to flowlines
 flowlines <- flowlines %>%
   mutate(COMID = as.character(COMID)) %>%
-  left_join(dmr_monthly_wide, by = c("COMID" = "matched_COMID"))
+  left_join(dmr_monthly_wide, by = c("COMID" = "matched_COMID")) %>%
+  left_join(
+    wwtp_pts %>%
+      st_drop_geometry() %>%
+      distinct(matched_COMID, .keep_all = TRUE) %>%
+      select(Facility, matched_COMID) %>%
+      mutate(matched_COMID = as.character(matched_COMID)),
+    by = c("COMID" = "matched_COMID")
+  )
 
-# ======================================================================
-# 4) Downstream cumulative WW (mean/var/low/high) by month
-# ======================================================================
-
+# --- Downstream WW Flow & Contributor Accumulation (monthly) -----------------
 flowlines$Hydroseq   <- as.character(flowlines$Hydroseq)
 flowlines$DnHydroseq <- as.character(flowlines$DnHydroseq)
 
@@ -227,64 +231,43 @@ flow_map <- flowlines %>%
   mutate(across(starts_with("WW_"), as.numeric)) %>%
   arrange(desc(as.numeric(Hydroseq)))
 
-# Aggregate duplicates by Hydroseq
 flow_map <- flow_map %>%
   group_by(Hydroseq) %>%
   summarise(
     DnHydroseq = first(DnHydroseq),
-    across(starts_with("WW_mean_"), ~ sum(.x, na.rm = TRUE)),
-    across(starts_with("WW_var_"),  ~ sum(.x, na.rm = TRUE)),
+    across(starts_with("WW_mean_"), ~sum(.x, na.rm = TRUE)),
+    across(starts_with("WW_var_"),  ~sum(.x, na.rm = TRUE)),
     .groups = "drop"
   ) %>%
   arrange(desc(as.numeric(Hydroseq)))
 
-# Consistency check
-check_hseq <- flow_map %>%
-  mutate(
-    Hydroseq_num   = as.numeric(Hydroseq),
-    DnHydroseq_num = as.numeric(DnHydroseq)
-  ) %>%
-  filter(!is.na(DnHydroseq_num))
-
-if (any(check_hseq$DnHydroseq_num >= check_hseq$Hydroseq_num)) {
-  warning("Some DnHydroseq have Hydroseq >= upstream segment; verify network ordering.")
-}
-
-# Setup indices
 idx    <- setNames(seq_len(nrow(flow_map)), flow_map$Hydroseq)
 dn_idx <- idx[flow_map$DnHydroseq]
 
-# Initialize cumulative mean/variance
 for (mm in mon_codes) {
-  flow_map[[paste0("WW_cum_mean_", mm)]] <- coalesce(flow_map[[paste0("WW_mean_", mm)]], 0)
-  flow_map[[paste0("WW_cum_var_",  mm)]] <- coalesce(flow_map[[paste0("WW_var_",  mm)]],  0)
+  flow_map[[paste0("WW_cum_mean_", mm)]] <- dplyr::coalesce(flow_map[[paste0("WW_mean_", mm)]], 0)
+  flow_map[[paste0("WW_cum_var_",  mm)]] <- dplyr::coalesce(flow_map[[paste0("WW_var_",  mm)]], 0)
 }
 
-# Accumulate downstream
 for (i in seq_len(nrow(flow_map))) {
   j <- dn_idx[i]
   if (!is.na(j)) {
     for (mm in mon_codes) {
-      mcol <- paste0("WW_cum_mean_", mm)
-      vcol <- paste0("WW_cum_var_",  mm)
-      flow_map[[mcol]][j] <- flow_map[[mcol]][j] + flow_map[[mcol]][i]
-      flow_map[[vcol]][j] <- flow_map[[vcol]][j] + flow_map[[vcol]][i]
+      flow_map[[paste0("WW_cum_mean_", mm)]][j] <- flow_map[[paste0("WW_cum_mean_", mm)]][j] +
+        flow_map[[paste0("WW_cum_mean_", mm)]][i]
+      flow_map[[paste0("WW_cum_var_",  mm)]][j] <- flow_map[[paste0("WW_cum_var_",  mm)]][j] +
+        flow_map[[paste0("WW_cum_var_",  mm)]][i]
     }
   }
 }
 
-# Compute SD / low / high
 for (mm in mon_codes) {
-  var_col <- paste0("WW_cum_var_",  mm)
-  sd_col  <- paste0("WW_cum_sd_",   mm)
-  flow_map[[sd_col]] <- sqrt(pmax(flow_map[[var_col]], 0))
-  
-  mean_col <- paste0("WW_cum_mean_", mm)
-  flow_map[[paste0("WW_cum_low_",  mm)]] <- pmax(flow_map[[mean_col]] - flow_map[[sd_col]], 0)
-  flow_map[[paste0("WW_cum_high_", mm)]] <-       flow_map[[mean_col]] + flow_map[[sd_col]]
+  sd_col <- paste0("WW_cum_sd_", mm)
+  flow_map[[sd_col]] <- sqrt(pmax(flow_map[[paste0("WW_cum_var_", mm)]], 0))
+  flow_map[[paste0("WW_cum_low_",  mm)]] <- pmax(flow_map[[paste0("WW_cum_mean_", mm)]] - flow_map[[sd_col]], 0)
+  flow_map[[paste0("WW_cum_high_", mm)]] <-      flow_map[[paste0("WW_cum_mean_", mm)]] + flow_map[[sd_col]]
 }
 
-# Attach cumulative WW to flowlines
 flowlines <- flowlines %>%
   left_join(
     flow_map %>%
