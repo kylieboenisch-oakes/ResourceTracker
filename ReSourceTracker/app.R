@@ -6,6 +6,8 @@ library(sf)
 library(shiny)
 library(viridisLite)
 
+#Set working directory of cloned repo
+setwd("/Users/kylieboenischoakes/Documents/ResourceTracker/ReSourceTracker")
 # --- Relative Paths ----------------------------------------------------------
 data_dir <- "data-raw"
 
@@ -58,6 +60,22 @@ rurality_colors <- c(
   "Rural"    = "#7570b3"
 )
 
+#Columns that need to be adjusted post-hoc (proportion, convert to whole number percent)
+proportion_cols <- c(
+  "Percent Black or African American alone",
+  "Percent American Indian / Alaska Native",
+  "Percent Asian",
+  "Percent Native Hawaiian or Pacific",
+  "Percent two or more races",
+  "Percent White",
+  "Percent Hispanic or Latino",
+  "Percent other races",
+  "Percent age under 10",
+  "Percent age 10 to 64",
+  "Percent age over 64",
+  "Adjusted percent of individuals below 200% Federal Poverty Line",
+  "Share of homes with no kitchen or indoor plumbing (percent)"
+)
 # Plot theme - consistent
 theme_app <- function() {
   theme_minimal(base_size = 15) +
@@ -1435,7 +1453,11 @@ server <- function(input, output, session) {
       ) %>%
       dplyr::arrange(.bin_id) %>%
       dplyr::mutate(
-        label = paste0("[", round(lo, 3), ", ", round(hi, 3), "]"),
+        label = if (var %in% proportion_cols) {
+          paste0("[", round(lo * 100, 0), ", ", round(hi * 100, 0), "]")
+        } else {
+          paste0("[", round(lo, 1), ", ", round(hi, 1), "]")
+        },
         label = dplyr::if_else(.bin_id == 1, paste0(label, " (lowest)"), label),
         label = dplyr::if_else(.bin_id == dplyr::n(), paste0(label, " (highest)"), label)
       )
