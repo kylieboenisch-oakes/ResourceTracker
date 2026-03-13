@@ -6,8 +6,6 @@ library(sf)
 library(shiny)
 library(viridisLite)
 
-#Set working directory of cloned repo
-setwd("/Users/kylieboenischoakes/Documents/ResourceTracker/ReSourceTracker")
 # --- Relative Paths ----------------------------------------------------------
 data_dir <- "data-raw"
 
