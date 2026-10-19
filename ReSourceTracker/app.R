@@ -1,80 +1,65 @@
+# ReSource Tracker: deployed (slim) app
+#
+# Loads pre-computed tables built by build_app_data.R from the full pipeline
+# (app_full.R). To change the data or the flow/wastewater methods, edit
+# app_full.R, rerun build_app_data.R locally, and commit the refreshed
+# data-raw/*_app.rds files with this file.
+
 # --- Libraries ---------------------------------------------------------------
 library(tidyverse)
-library(readxl)
-library(leaflet)
 library(sf)
 library(shiny)
+library(mapgl)
 library(viridisLite)
+# Also used via pkg:: calls: scales, sandwich (cluster-robust SEs)
 
-# --- Relative Paths ----------------------------------------------------------
+# --- Load pre-computed data --------------------------------------------------
 data_dir <- "data-raw"
 
-paths <- list(
-  dwtp_rds      = file.path(data_dir, "geocoded_dwtp_app.rds"),
-  cejst_rds     = file.path(data_dir, "cejst_with_rurality.rds"),
-  wwtp_rds      = file.path(data_dir, "wwtp_pts_app.rds"),
-  gages_rds     = file.path(data_dir, "usgs_gages_sf_app.rds"),
-  monthly_flows = file.path(data_dir, "CO_Seasonal_Flow_Summary_Feb2026.csv"), 
-  flowlines     = file.path(data_dir, "flowlines_small.rds"),
-  fl_cejst      = file.path(data_dir, "flowlines_cejst_table.rds"),
-  tracts_rds    = file.path(data_dir, "tracts_sf_app.rds") 
-)
+read_app <- function(name) {
+  p <- file.path(data_dir, paste0(name, ".rds"))
+  if (!file.exists(p)) {
+    stop("Missing ", p, ". Run build_app_data.R locally and commit its outputs.", call. = FALSE)
+  }
+  readRDS(p)
+}
 
-# Pre-trimmed flowlines (sf, EPSG:4326)
-flowlines <- readRDS(paths$flowlines)
-
-# CEJST + rurality (no geometry, small)
-cejst <- readRDS(paths$cejst_rds)
-
-# Flowline x CEJST table for Equity + Seasonality (no geometry)
-fl_cejst <- readRDS(paths$fl_cejst)
-
-# Tract polygons with CEJST + rurality (for map layer / info panel)
-tracts_sf <- readRDS(paths$tracts_rds)
+flowlines   <- read_app("flowlines_app")    # sf, EPSG:4326, map columns only
+fl_cejst    <- read_app("fl_cejst_app")     # segment x tract table (no geometry)
+cejst       <- read_app("cejst_app")        # CEJST + rurality (no geometry)
+tracts_map  <- read_app("tracts_map_app")   # tract polygons + popup_html
+tracts_info <- read_app("tracts_info_app")  # GEOID, rurality, low_income
+dwtp_map    <- read_app("dwtp_map_app")
+wwtp_map    <- read_app("wwtp_map_app")
+gages_map   <- read_app("gages_map_app")
 
 # --- Constants ---------------------------------------------------------------
-mon_codes    <- sprintf("%02d", 1:12)          # "01"–"12"
-month_labels <- setNames(month.name, mon_codes)  # names "01".."12" → "January"...
+mon_codes    <- sprintf("%02d", 1:12)            # "01"–"12"
+month_labels <- setNames(month.name, mon_codes)  # "01" -> "January"
 month_colors <- setNames(
   c(
-    "#3B4F8F", # 01 Jan  
-    "#4B6CB7", # 02 Feb  
-    "#3C9D82", # 03 Mar  
-    "#54B887", # 04 Apr  
-    "#7BC96F", # 05 May  
-    "#F4D35E", # 06 Jun  
-    "#F6B35E", # 07 Jul  
-    "#F28E52", # 08 Aug  
-    "#E76F51", # 09 Sep  
-    "#D95F5F", # 10 Oct  
-    "#A8558C", # 11 Nov  
-    "#6D4C9B"  # 12 Dec 
+    "#3B4F8F", # 01 Jan
+    "#4B6CB7", # 02 Feb
+    "#3C9D82", # 03 Mar
+    "#54B887", # 04 Apr
+    "#7BC96F", # 05 May
+    "#F4D35E", # 06 Jun
+    "#F6B35E", # 07 Jul
+    "#F28E52", # 08 Aug
+    "#E76F51", # 09 Sep
+    "#D95F5F", # 10 Oct
+    "#A8558C", # 11 Nov
+    "#6D4C9B"  # 12 Dec
   ),
   mon_codes
 )
-# Consistent colors for rurality categories (Urban / Rural) 
+# Consistent colors for rurality categories (Urban / Rural)
 rurality_colors <- c(
-  "Urban"    = "#1b9e77",
-  "Rural"    = "#7570b3"
+  "Urban" = "#1b9e77",
+  "Rural" = "#7570b3"
 )
 
-#Columns that need to be adjusted post-hoc (proportion, convert to whole number percent)
-proportion_cols <- c(
-  "Percent Black or African American alone",
-  "Percent American Indian / Alaska Native",
-  "Percent Asian",
-  "Percent Native Hawaiian or Pacific",
-  "Percent two or more races",
-  "Percent White",
-  "Percent Hispanic or Latino",
-  "Percent other races",
-  "Percent age under 10",
-  "Percent age 10 to 64",
-  "Percent age over 64",
-  "Adjusted percent of individuals below 200% Federal Poverty Line",
-  "Share of homes with no kitchen or indoor plumbing (percent)"
-)
-# Plot theme - consistent
+# Plot theme - consistent across tabs
 theme_app <- function() {
   theme_minimal(base_size = 15) +
     theme(
@@ -88,501 +73,580 @@ theme_app <- function() {
     )
 }
 
-# --- Load Datasets -----------------------------------------------------------
-# DWTPs
-geocoded_dwtp <- readRDS(paths$dwtp_rds)
+safe_round <- function(x) ifelse(is.finite(x), round(x, 1), "NA")
+pal <- scales::col_numeric(viridisLite::plasma(256), domain = c(0, 100), na.color = "transparent")
 
-# WWTPs
-wwtp_pts <- readRDS(paths$wwtp_rds)
+# Boolean CEJST columns are treated like rurality.
+# Only the hardcoded columns below are offered (disadvantaged yes/no)
+cejst_lgl_keep <- c("Identified as disadvantaged")
+cejst_lgl_cols <- intersect(cejst_lgl_keep, names(cejst)[sapply(cejst, is.logical)])
+is_cat_var <- function(v) identical(v, "rurality") || isTRUE(v %in% cejst_lgl_cols)
+
+# --- Statistics helpers ------------------------------------------------------
+eq_zs <- function(x) as.numeric(scale(x))
+eq_zr <- function(x) as.numeric(scale(rank(x)))
+
+# cluster-robust (county) estimate, 95% CI, p for the coefficient `term`
+eq_robust <- function(m, term, cl, odds = FALSE) {
+  G <- length(unique(cl)); V <- sandwich::vcovCL(m, cluster = cl, type = "HC1")
+  b <- unname(stats::coef(m)[term]); se <- sqrt(V[term, term]); tc <- stats::qt(0.975, G - 1)
+  r <- c(est = b, lo = b - tc * se, hi = b + tc * se); if (odds) r <- exp(r)
+  c(r, p = 2 * stats::pt(-abs(b / se), G - 1))
+}
+
+# One indicator -> unadjusted + drainage-area-adjusted effect.
+#   Severity  : rank correlation (rho); adjusted = also controls for log10 drainage area
+#   Prevalence: odds ratio (Yes vs No, or per +1 SD); adjusted = also controls for log10 drainage area + log(# segments)
+eq_fit <- function(tab, var, mode) {
+  tryCatch({
+    x <- if (identical(var, "rurality")) as.numeric(tab$rurality == "Rural") else as.numeric(tab[[var]])
+    covs <- if (identical(mode, "Severity")) "lDA" else c("lDA", "lnseg")
+    dd <- data.frame(cl = tab$county, y = as.numeric(tab$metric_value), x = x)
+    for (v in covs) dd[[v]] <- as.numeric(tab[[v]])
+    dd <- dd[stats::complete.cases(dd) & Reduce(`&`, lapply(dd[-1], is.finite)), , drop = FALSE]
+    covs <- covs[vapply(covs, function(v) length(unique(dd[[v]])) > 1, logical(1))]
+    G <- length(unique(dd$cl))
+    if (nrow(dd) < 50 || G < 15 || length(unique(dd$x)) < 2) return(NULL)
+    is_bin <- all(dd$x %in% c(0, 1))
+    if (identical(mode, "Severity")) {
+      dd$ys <- eq_zr(dd$y); dd$xs <- if (is_bin) eq_zs(dd$x) else eq_zr(dd$x)
+      for (v in covs) dd[[v]] <- eq_zr(dd[[v]])
+      m0 <- stats::lm(ys ~ xs, dd); m1 <- stats::lm(stats::reformulate(c("xs", covs), "ys"), dd); odds <- FALSE
+    } else {
+      dd$xs <- if (is_bin) dd$x else eq_zs(dd$x)
+      for (v in covs) dd[[v]] <- eq_zs(dd[[v]])
+      m0 <- suppressWarnings(stats::glm(y ~ xs, stats::binomial, dd))
+      m1 <- suppressWarnings(stats::glm(stats::reformulate(c("xs", covs), "y"), stats::binomial, dd)); odds <- TRUE
+    }
+    a <- eq_robust(m0, "xs", dd$cl, odds); b <- eq_robust(m1, "xs", dd$cl, odds)
+    data.frame(indicator = var, type = if (is_bin) "yes/no" else "continuous", n_tracts = nrow(dd), n_counties = G,
+               effect_unadj = a[["est"]], lo_unadj = a[["lo"]], hi_unadj = a[["hi"]], p_unadj = a[["p"]],
+               effect_adj   = b[["est"]], lo_adj   = b[["lo"]], hi_adj   = b[["hi"]], p_adj   = b[["p"]],
+               stringsAsFactors = FALSE)
+  }, error = function(e) NULL)
+}
+
+# One-line text used in plot subtitles
+eq_stat_line <- function(r, mode) {
+  if (is.null(r) || nrow(r) != 1) return(NULL)
+  f <- function(x) formatC(x, format = "f", digits = 2)
+  nm <- if (identical(mode, "Prevalence")) "OR" else "rho"
+  sprintf("Adjusted for drainage area: %s = %s (95%% CI %s to %s), BH q = %s  |  unadjusted %s = %s",
+          nm, f(r$effect_adj), f(r$lo_adj), f(r$hi_adj), formatC(r$q_adj, format = "e", digits = 1),
+          nm, f(r$effect_unadj))
+}
+
+# Paired rank-biserial: +1 = month A higher than month B in every unit, -1 = always lower
+eq_rb_paired <- function(a, b) {
+  d <- a - b
+  d <- d[is.finite(d) & d != 0]
+  if (length(d) < 5) return(NA_real_)
+  r <- rank(abs(d))
+  (sum(r[d > 0]) - sum(r[d < 0])) / sum(r)
+}
+
+# Kendall's W (tie-corrected) from a ranks matrix R (units x months)
+eq_w_calc <- function(R, Tv, k, idx) {
+  n  <- length(idx)
+  Rj <- colSums(R[idx, , drop = FALSE])
+  S  <- sum((Rj - mean(Rj))^2)
+  den <- n^2 * (k^3 - k) - n * sum(Tv[idx])
+  if (!is.finite(den) || den <= 0) return(NA_real_)
+  12 * S / den
+}
+
+# One bootstrap draw of row indices, resampling whole county groups
+eq_boot_idx <- function(groups) {
+  g <- sample.int(length(groups), replace = TRUE)
+  unlist(groups[g], use.names = FALSE)
+}
 
 # --- UI ----------------------------------------------------------------------
 ui <- tagList(
-  # ---- Global style to allow tract-info to wrap well ------------------------
+  # ---- Global style so the tract info panel wraps well ----------------------
   tags$head(
     tags$style(HTML("
-      /* Make the tract info panel wrap text instead of overflowing */
       #tract_info {
-        white-space: pre-wrap;     /* respect line breaks but wrap long lines */
-        word-break: break-word;    /* break long tokens if needed */
-        font-size: 0.9em;          /* slightly smaller text */
-        max-height: 350px;         /* keep it from growing forever */
-        overflow-y: auto;          /* scroll if it gets long */
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.9em;
+        max-height: 350px;
+        overflow-y: auto;
       }
-
-      /* On smaller screens, shrink a bit more */
       @media (max-width: 1200px) {
-        #tract_info {
-          font-size: 0.85em;
-          max-height: 250px;
-        }
+        #tract_info { font-size: 0.85em; max-height: 250px; }
       }
-
       @media (max-width: 768px) {
-        #tract_info {
-          font-size: 0.8em;
-          max-height: 200px;
-        }
+        #tract_info { font-size: 0.8em; max-height: 200px; }
       }
     "))
   ),
   
-  # ========================= NAVBAR ===========================================
   navbarPage(
     "ReSource Tracker",
-  # ========================= TAB 1: MAP ======================================
+    
+    # ========================= TAB 1: MAP ====================================
     tabPanel(
-    "Map",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 3,
-          #make sidebar scrollable if content gets long
-          style = "max-height: 900px; overflow-y: auto;",
-          
-          h4("Map Controls"),
-          helpText(
-            "Explore how much of streamflow is contributed by upstream ",
-            "wastewater discharges. Choose the denominator source and month."
-          ),
-          radioButtons(
-            "src", "Denominator source",
-            choices  = c("Gage-based", "NHDPlus-based"),
-            selected = "Gage-based", inline = FALSE
-          ),
-          selectInput(
-            "month", "Month (flow conditions)",
-            choices  = setNames(mon_codes, month_labels),
-            selected = "06"
-          ),
-          
-          actionButton(
-            "reset_map",
-            label = "Reset Map View",
-            icon  = icon("refresh"),
-            width = "100%"
-          ),
-          
-          tags$hr(),
-          
-          h4("Quick guide"),
-          tags$small(
-            "Hover over a stream and click to see:",
-            tags$br(),
-            "• Selected month wastewater flow (cfs)",
-            tags$br(),
-            "• % wastewater for the chosen denominator",
-            tags$br(), tags$br(),
-            "For equity analysis using Climate and Economic Justice Screening Tool (CEJST) indicators, use the 'Equity' tab."
-          ),
-          
-          tags$hr(),
-          h4("Selected census tract"),
-          tags$small("Click a tract polygon to see tract-level stats for the selected month and denominator."),
-          verbatimTextOutput("tract_info")
-        ),
-        
-        column(
-          width = 9,
-          leafletOutput("map", height = "900px")
-        )
-      )
-    )
-  ),
-  
-  # ====================== TAB 2: HOW TO USE =================================
-  tabPanel(
-    "How to Use",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 8,
-          h3("How to use ReSource Tracker"),
-          p(
-            "This tool estimates the fraction of streamflow composed of ",
-            "treated wastewater effluent for each NHDPlus flowline in Colorado."
-          ),
-          h4("1. Choose a denominator source (Map tab)"),
-          tags$ul(
-            tags$li(
-              strong("Gage-based: "),
-              "USGS stream gage data are processed into monthly means ",
-              "and propagated downstream along hydrologically similar segments. ",
-              "This is the preferred denominator where available."
+      "Map",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 3,
+            style = "max-height: 900px; overflow-y: auto;",
+            
+            h4("Map Controls"),
+            helpText(
+              "Explore how much of streamflow is contributed by upstream ",
+              "wastewater discharges. Choose the denominator source and month."
             ),
-            tags$li(
-              strong("NHDPlus-based: "),
-              "Uses NHDPlus mean monthly flows (original NHDPlus volumes). ",
-              "These provide statewide coverage but can overestimate flows in ",
-              "regulated or drought-impacted streams."
-            )
-          ),
-          h4("2. Select a month (Map tab)"),
-          p(
-            "Use the Month selector to switch between January–December. ",
-            "All wastewater flows and percent wastewater values are computed ",
-            "for the selected month."
-          ),
-          h4("3. Interpret the stream colors (Map tab)"),
-          p(
-            "Stream colors show the estimated percent wastewater for the ",
-            "selected month and denominator source."
-          ),
-          tags$ul(
-            tags$li("Dark colors ≈ low % wastewater (near 0%)."),
-            tags$li("Bright colors ≈ high % wastewater (approaching 100%).")
-          ),
-          h4("4. Explore equity impacts (Equity tab)"),
-          p(
-            "The Equity tab links the stream network to Climate and Economic Justice Screening Tool (CEJST) census tracts. ",
-            "For each tract, it summarizes tract-level wastewater prevalence (whether any intersecting segment is impacted) ",
-            "and severity (how large % wastewater is among impacted segments), ",
-            "and compares those exposures across bins of tract-level CEJST indicators."
-          ),
-          h4("5. Reading the popups (Map tab)"),
-          p("Click on a stream segment to see a popup with:"),
-          tags$ul(
-            tags$li("The NHDPlus Hydroseq ID (unique segment identifier)."),
-            tags$li("Monthly wastewater flow (mean, low, high) in cfs."),
-            tags$li("% wastewater (mean/min/max) for the selected month."),
-            tags$li("Which gage(s) are used for the denominator."),
-            tags$li("Whether flow comes from a direct gage, propagated gage, or NHDPlus only."),
-            tags$li("Top contributing wastewater treatment plants on that segment.")
-          )
-        )
-      )
-    )
-  ),
-  
-  # ==================== TAB 3: EQUITY =======================================
-  tabPanel(
-    "Equity",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 3,
-          h4("CEJST & Exposure Settings"),
-          helpText(
-            "Two modes:",
-            tags$br(),
-            tags$ul(
-              tags$li(strong("Prevalence:"), " tract-level (does the tract have ANY impacted segment?)."),
-              tags$li(strong("Severity:"), " among impacted segments (%WW > 0), how large the contribution is.")
-            )
-          ),
-          
-          radioButtons(
-            "cejst_mode", "Analysis mode",
-            choices  = c("Prevalence", "Severity"),
-            selected = "Prevalence",
-            inline   = FALSE
-          ),
-          
-          conditionalPanel(
-            condition = "input.cejst_mode == 'Severity'",
             radioButtons(
-              "cejst_src", "Denominator source (severity only)",
+              "src", "Denominator source",
               choices  = c("Gage-based", "NHDPlus-based"),
-              selected = "Gage-based",
+              selected = "Gage-based", inline = FALSE
+            ),
+            selectInput(
+              "month", "Month (flow conditions)",
+              choices  = setNames(mon_codes, month_labels),
+              selected = "06"
+            ),
+            
+            actionButton(
+              "reset_map",
+              label = "Reset Map View",
+              icon  = icon("refresh"),
+              width = "100%"
+            ),
+            
+            tags$hr(),
+            
+            h4("Quick guide"),
+            tags$small(
+              "Hover over a stream and click to see:",
+              tags$br(),
+              "• Selected month wastewater flow (cfs)",
+              tags$br(),
+              "• % wastewater for the chosen denominator",
+              tags$br(),
+              "• Upstream WWTP contributors and gage info",
+              tags$br(), tags$br(),
+              "For equity analysis using Climate and Economic Justice Screening Tool (CEJST) indicators, use the 'Equity' tab."
+            ),
+            
+            tags$hr(),
+            h4("Selected census tract"),
+            verbatimTextOutput("tract_info")
+          ),
+          
+          column(
+            width = 9,
+            maplibreOutput("map", height = "900px")
+          )
+        )
+      )
+    ),
+    
+    # ====================== TAB 2: HOW TO USE ===============================
+    tabPanel(
+      "How to Use",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 8,
+            h3("How to use ReSource Tracker"),
+            p(
+              "This tool estimates the fraction of streamflow composed of ",
+              "treated wastewater effluent for each NHDPlus flowline in Colorado."
+            ),
+            h4("1. Choose a denominator source (Map tab)"),
+            tags$ul(
+              tags$li(
+                strong("Gage-based: "),
+                "USGS stream gage data are processed into monthly means ",
+                "and propagated downstream along segments of similar drainage area, ",
+                "with flow scaled by the drainage-area ratio between segments. ",
+                "This is the preferred denominator where available."
+              ),
+              tags$li(
+                strong("NHDPlus-based: "),
+                "Uses NHDPlus mean monthly flows (original NHDPlus volumes). ",
+                "These provide statewide coverage but can overestimate flows in ",
+                "regulated or drought-impacted streams."
+              )
+            ),
+            h4("2. Select a month (Map tab)"),
+            p(
+              "Use the Month selector to switch between January–December. ",
+              "All wastewater flows and percent wastewater values are computed ",
+              "for the selected month."
+            ),
+            h4("3. Interpret the stream colors (Map tab)"),
+            p(
+              "Stream colors show the estimated percent wastewater for the ",
+              "selected month and denominator source."
+            ),
+            tags$ul(
+              tags$li("Dark colors ≈ low % wastewater (near 0%)."),
+              tags$li("Bright colors ≈ high % wastewater (approaching 100%).")
+            ),
+            h4("4. Explore equity impacts (Equity tab)"),
+            p(
+              "The Equity tab links the stream network to Climate and Economic Justice Screening Tool (CEJST) census tracts. ",
+              "For each tract, it summarizes tract-level wastewater prevalence (whether any intersecting segment is impacted) ",
+              "and severity (how large % wastewater is among impacted segments), ",
+              "and estimates how strongly each tract-level CEJST indicators is associated with wastewater influence, adjusting for drainage area."
+            ),
+            h4("5. Reading the popups (Map tab)"),
+            p("Click on a stream segment to see a popup with:"),
+            tags$ul(
+              tags$li("The NHDPlus Hydroseq ID (unique segment identifier)."),
+              tags$li("Monthly wastewater flow (mean, low, high) in cfs."),
+              tags$li("% wastewater (mean/min/max) for the selected month."),
+              tags$li("Which gage(s) are used for the denominator."),
+              tags$li("Whether flow comes from a direct gage, propagated gage, or NHDPlus only."),
+              tags$li("Top contributing wastewater treatment plants on that segment.")
+            )
+          )
+        )
+      )
+    ),
+    
+    # ==================== TAB 3: EQUITY =====================================
+    tabPanel(
+      "Equity",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 3,
+            h4("CEJST & Wastewater Influence Settings"),
+            helpText(
+              "Two modes:",
+              tags$br(),
+              tags$ul(
+                tags$li(strong("Prevalence:"), " tract-level (does the tract have ANY impacted segment?)."),
+                tags$li(strong("Severity:"), " among impacted segments (%WW > 0), how large the contribution is.")
+              )
+            ),
+            
+            radioButtons(
+              "cejst_mode", "Analysis mode",
+              choices  = c("Prevalence", "Severity"),
+              selected = "Prevalence",
               inline   = FALSE
-            )
-          ),
-          
-          selectInput(
-            "cejst_month", "Month (flow conditions)",
-            choices  = setNames(mon_codes, month_labels),
-            selected = "06"
-          ),
-          
-          selectInput(
-            "rurality",
-            "Rurality category",
-            choices  = c("All", "Urban", "Rural"),
-            selected = "All"
-          ),
-          
-          ## <-- Download block moved into sidebar here
-          tags$hr(),
-          h4("Download"),
-          helpText("Export tract-level data used in the current equity plot."),
-          downloadButton("download_cejst_data", "Download equity CSV"),
-          
-          tags$hr(),
-          h4("Grouping variable (x-axis bins)"),
-          helpText(
-            "Choose a CEJST numeric indicator (binned) or Rurality (categorical).",
-            tags$br(), tags$br(),
-            strong("To compare Urban/Rural:"),
-            tags$br(),
-            HTML("&bull; Set <b>Rurality category</b> to <b>All</b>"),
-            tags$br(),
-            HTML("&bull; Set <b>Grouping variable</b> to <b>Rurality</b>"),
-            tags$br(), tags$br(),
-            HTML(
-              'Definitions of CEJST parameters: ',
-              '<a href="https://public-environmental-data-partners.github.io/j40-cejst-2/en/methodology#3/33.47/-97.5" target="_blank">CEJST methodology &amp; data dictionary</a>.'
-            )
-          ),
-          
-          selectInput(
-            "cejst_var_box",
-            "CEJST variable",
-            choices = NULL
-          ),
-          
-          conditionalPanel(
-            condition = "input.cejst_var_box != 'rurality'",
-            sliderInput(
-              "cejst_nbins",
-              "Number of bins (numeric variables only)",
-              min   = 2,
-              max   = 6,
-              value = 4,
-              step  = 1,
-              round = TRUE,
-              ticks = FALSE
-            )
-          )
-        ),
-        
-        column(
-          width = 9,
-          h3("Exposure Plot: By CEJST Indicator or Rurality"),
-          plotOutput("cejst_plot", height = "520px"),
-          tags$hr(),
-          h4("Statistical comparison between groups"),
-          verbatimTextOutput("cejst_stats")
-        )
-      )
-    )
-  ),
-  
-  #==================  TAB 4: SEASONALITY ===================================
-  tabPanel(
-    "Seasonality",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 3,
-          h4("Seasonality settings"),
-          helpText("Monthly summaries across all tracts (or filtered)."),
-          
-          radioButtons(
-            "season_src", "Denominator source (%WW)",
-            choices = c("Gage-based", "NHDPlus-based"),
-            selected = "Gage-based",
-            inline = FALSE
-          ),
-          
-          selectInput(
-            "season_rurality",
-            "Rurality category",
-            choices  = c("All", "Urban", "Rural"),
-            selected = "All"
-          ),
-          
-          checkboxInput(
-            "season_use_tracts",
-            "Summarize at tract-level (instead of segment-level)",
-            TRUE
-          ),
-          helpText("Tract-level collapses many segments into one value per tract per month."),
-          
-          tags$hr(),
-          
-          h4("Download"),
-          helpText("Export the data used to draw the seasonality plot."),
-          downloadButton("download_season_data", "Download seasonality CSV")
-        ),
-        
-        column(
-          width = 9,
-          h3("Seasonal patterns in wastewater influence"),
-          plotOutput("season_plot_median", height = "420px"),
-          tags$hr(),
-          verbatimTextOutput("season_text"),
-          
-          tags$hr(),
-          h4("Month-to-month statistics"),
-          verbatimTextOutput("season_stats_text")
-        )
-      )
-    )
-  ),
-  
-  # ================== TAB 5: DATA SOURCES ===================================
-  tabPanel(
-    "Data Sources",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 8,
-          h3("Core input datasets"),
-          p(
-            "This tab documents the main input datasets used to build the ",
-            "ReSource Tracker. Where possible, links point to ",
-            "public, externally maintained sources. Processed versions (e.g., ",
-            "Colorado-only subsets, network-joined tables) are distributed via ",
-            "the accompanying manuscript / repository."
-          ),
-          
-          h4("1. Stream network and base hydrology"),
-          tags$ul(
-            tags$li(
-              strong("NHDPlus flowlines: "),
-              "National Hydrography Dataset Plus (NHDPlus) flowlines and ",
-              "associated attributes (e.g., COMID, Hydroseq, mean annual flow). ",
-              "Used as the base river network and for routing wastewater and ",
-              "streamflow downstream."
             ),
-            tags$li(
-              strong("NHDPlus mean monthly flows: "),
-              "NHDPlus-supplied mean monthly flows are used as an alternative ",
-              "denominator when USGS gage data are unavailable."
-            )
-          ),
-          
-          h4("2. USGS stream gage records"),
-          tags$ul(
-            tags$li(
-              strong("USGS NWIS daily streamflow: "),
-              "Daily discharge (cfs) time series for Colorado gages, retrieved ",
-              "from the USGS National Water Information System (NWIS). These ",
-              "records are aggregated to monthly means and propagated along the ",
-              "NHDPlus network to estimate contemporary streamflow conditions."
+            
+            conditionalPanel(
+              condition = "input.cejst_mode == 'Severity'",
+              radioButtons(
+                "cejst_src", "Denominator source (severity only)",
+                choices  = c("Gage-based", "NHDPlus-based"),
+                selected = "Gage-based",
+                inline   = FALSE
+              )
             ),
-            tags$li(
-              strong("Gage–COMID linkage: "),
-              "Each gage is spatially matched to its nearest NHDPlus COMID; ",
-              "only one gage per COMID is retained, favoring the longest and ",
-              "most recent record."
-            )
-          ),
-          
-          h4("3. Wastewater treatment plants and discharges"),
-          tags$ul(
-            tags$li(
-              strong("WWTP locations: "),
-              "Facility coordinates and design flows for municipal wastewater ",
-              "treatment plants discharging to surface waters in Colorado. ",
-              "Used to place outfalls on the map and assign them to NHDPlus ",
-              "flowlines."
+            
+            selectInput(
+              "cejst_month", "Month (flow conditions)",
+              choices  = setNames(mon_codes, month_labels),
+              selected = "06"
             ),
-            tags$li(
-              strong("Discharge Monitoring Report (DMR) data: "),
-              "Monthly-average effluent flows are compiled from publicly ",
-              "reported DMR data. Flows are converted to cfs, aggregated by ",
-              "facility–COMID–month, and then accumulated downstream along the ",
-              "river network."
-            )
-          ),
-          
-          h4("4. Drinking water systems and intakes"),
-          tags$ul(
-            tags$li(
-              strong("Drinking water treatment plants (DWTPs): "),
-              "Geocoded locations of community drinking water systems, including ",
-              "population served and primary source type (e.g., surface water, ",
-              "groundwater, mixed). These points are displayed as map markers."
-            )
-          ),
-          
-          h4("5. Climate and Economic Justice Screening Tool (CEJST)"),
-          tags$ul(
-            tags$li(
-              strong("CEJST tract-level indicators: "),
-              "Census-tract–level CEJST data, including demographic, economic, ",
-              "health, climate, and pollution burden indicators. These fields ",
-              "are joined to each tract and then intersected with the stream ",
-              "network to summarize wastewater exposure by community."
-            )
-          ),
-          
-          h4("6. Processed intermediate tables"),
-          p(
-            "The following intermediate tables are generated within the analysis ",
-            "workflow and are not standalone external datasets, but are important ",
-            "for reproducibility:"
-          ),
-          tags$ul(
-            tags$li(
-              strong("Seasonal gage summary: "),
-              "Per-gage monthly mean, standard deviation, and low / high flow ",
-              "estimates used in the map popups."
+            
+            selectInput(
+              "rurality",
+              "Rurality category",
+              choices  = c("All", "Urban", "Rural"),
+              selected = "All"
             ),
-            tags$li(
-              strong("WWTP monthly flows: "),
-              "Facility–COMID–month tables of effluent discharge (cfs) before ",
-              "downstream accumulation."
+            
+            tags$hr(),
+            h4("Download"),
+            helpText("Export tract-level data used in the current equity plot."),
+            downloadButton("download_cejst_data", "Download equity CSV"),
+            
+            tags$hr(),
+            h4("Indicator"),
+            helpText(
+              "Choose a CEJST numeric indicator or Rurality.",
+              tags$br(), tags$br(),
+              strong("To compare Urban/Rural:"),
+              tags$br(),
+              HTML("&bull; Set <b>Rurality category</b> to <b>All</b>"),
+              tags$br(),
+              HTML("&bull; Set <b>Indicator</b> to <b>Rurality</b>"),
+              tags$br(), tags$br(),
+              HTML(
+                'Definitions of CEJST parameters: ',
+                '<a href="https://public-environmental-data-partners.github.io/j40-cejst-2/en/methodology#3/33.47/-97.5" target="_blank">CEJST methodology &amp; data dictionary</a>.'
+              )
             ),
-            tags$li(
-              strong("Tract-level exposure summary: "),
-              "For each tract, the median, 90th percentile, and maximum % ",
-              "wastewater across all intersecting stream segments for each ",
-              "month and denominator source."
+            
+            selectInput(
+              "cejst_var_box",
+              "CEJST variable",
+              choices = NULL
             )
           ),
           
-          h4("Accessing the inputs"),
-          p(
-            "Public links and permanent DOIs for the processed inputs (e.g., ",
-            "Colorado-only flowlines, gage summaries, CEJST-joined tables) will ",
-            "be provided in the associated manuscript, data repository, or ",
-            "project website. This tab serves as a living data dictionary for ",
-            "interpreting those files."
+          column(
+            width = 9,
+            h3("Wastewater influence and CEJST indicators"),
+            tags$p(
+              style = "color:#555;",
+              "Co-location patterns, adjusted for drainage area and clustered by county. ",
+              "Not causal, and not individual exposure. Prevalence results are descriptive."
+            ),
+            
+            h4("Overview: all indicators"),
+            helpText(
+              "Each row is one CEJST indicator, adjusted for drainage area. ",
+              "Filled = BH q < 0.05, open = not significant. Orange = the indicator selected on the left. ",
+              "Click a row to select it."
+            ),
+            checkboxInput("cejst_forest_all", "Show all indicators (default: the 20 largest effects)", FALSE),
+            plotOutput("cejst_forest", height = "auto", click = "cejst_forest_click"),
+            
+            tags$hr(),
+            h4("Selected indicator"),
+            uiOutput("cejst_card"),
+            plotOutput("cejst_plot", height = "520px")
           )
         )
       )
-    )
-  ),
-  
-  # ================== TAB 6: DOWNLOADS & METHODS =============================
-  tabPanel(
-    "Downloads & Methods",
-    fluidPage(
-      fluidRow(
-        column(
-          width = 8,
-          h3("Data & Methods"),
-          p(
-            "This tab will be updated to allow downloading of data for users to conduct their own analysis."
+    ),
+    
+    #==================  TAB 4: SEASONALITY =================================
+    tabPanel(
+      "Seasonality",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 3,
+            h4("Seasonality settings"),
+            helpText("Monthly summaries across all tracts (or filtered)."),
+            
+            radioButtons(
+              "season_src", "Denominator source (%WW)",
+              choices = c("Gage-based", "NHDPlus-based"),
+              selected = "Gage-based",
+              inline = FALSE
+            ),
+            
+            selectInput(
+              "season_rurality",
+              "Rurality category",
+              choices  = c("All", "Urban", "Rural"),
+              selected = "All"
+            ),
+            
+            checkboxInput(
+              "season_use_tracts",
+              "Summarize at tract-level (instead of segment-level)",
+              TRUE
+            ),
+            helpText("Tract-level collapses many segments into one value per tract per month."),
+            
+            tags$hr(),
+            
+            h4("Download"),
+            helpText("Export the data used to draw the seasonality plot."),
+            downloadButton("download_season_data", "Download seasonality CSV")
           ),
-          h4("Flow estimation and propagation (summary)"),
-          tags$ul(
-            tags$li(
-              "USGS daily streamflow records (post–2001) are aggregated to ",
-              "monthly means, with variability summarized using the interannual ",
-              "standard deviation and corresponding mean ± 1 SD bands (low/high) ",
-              "for each calendar month."
+          
+          column(
+            width = 9,
+            h3("Seasonal patterns in wastewater influence"),
+            plotOutput("season_plot_median", height = "420px"),
+            tags$hr(),
+            verbatimTextOutput("season_text"),
+            
+            tags$hr(),
+            h4("Month-to-month statistics"),
+            verbatimTextOutput("season_stats_text")
+          )
+        )
+      )
+    ),
+    
+    # ================== TAB 5: DATA SOURCES =================================
+    tabPanel(
+      "Data Sources",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 8,
+            h3("Core input datasets"),
+            p(
+              "This tab documents the main input datasets used to build the ",
+              "ReSource Tracker. Where possible, links point to ",
+              "public, externally maintained sources. Processed versions (e.g., ",
+              "Colorado-only subsets, network-joined tables) are distributed via ",
+              "the accompanying manuscript / repository."
             ),
-            tags$li(
-              "Each gage is mapped to its closest NHDPlus flowline (COMID); ",
-              "only one gage per COMID is retained, favoring the longest and ",
-              "most recent record."
+            
+            h4("1. Stream network and base hydrology"),
+            tags$ul(
+              tags$li(
+                strong("NHDPlus flowlines: "),
+                "National Hydrography Dataset Plus (NHDPlus) flowlines and ",
+                "associated attributes (e.g., COMID, Hydroseq, mean annual flow). ",
+                "Used as the base river network and for routing wastewater and ",
+                "streamflow downstream."
+              ),
+              tags$li(
+                strong("NHDPlus mean monthly flows: "),
+                "NHDPlus-supplied mean monthly flows are used as an alternative ",
+                "denominator when USGS gage data are unavailable."
+              )
             ),
-            tags$li(
-              "Monthly flows are propagated downstream along hydrologically ",
-              "similar segments (based on modeled mean annual flow), stopping ",
-              "at large changes in flow or at new gages."
+            
+            h4("2. USGS stream gage records"),
+            tags$ul(
+              tags$li(
+                strong("USGS NWIS daily streamflow: "),
+                "Daily discharge (cfs) time series for Colorado gages, retrieved ",
+                "from the USGS National Water Information System (NWIS). These ",
+                "records are aggregated to monthly means and propagated along the ",
+                "NHDPlus network to estimate contemporary streamflow conditions."
+              ),
+              tags$li(
+                strong("Gage–COMID linkage: "),
+                "Each gage is spatially matched to its nearest NHDPlus COMID; ",
+                "only one gage per COMID is retained, favoring the longest and ",
+                "most recent record."
+              )
             ),
-            tags$li(
-              "At confluences, flows from multiple upstream gaged branches ",
-              "are summed to represent the combined segment."
+            
+            h4("3. Wastewater treatment plants and discharges"),
+            tags$ul(
+              tags$li(
+                strong("WWTP locations: "),
+                "Facility coordinates and design flows for municipal wastewater ",
+                "treatment plants discharging to surface waters in Colorado. ",
+                "Used to place outfalls on the map and assign them to NHDPlus ",
+                "flowlines."
+              ),
+              tags$li(
+                strong("Discharge Monitoring Report (DMR) data: "),
+                "Monthly-average effluent flows are compiled from publicly ",
+                "reported DMR data. Flows are converted to cfs, aggregated by ",
+                "facility–COMID–month, and then accumulated downstream along the ",
+                "river network."
+              )
+            ),
+            
+            h4("4. Drinking water systems and intakes"),
+            tags$ul(
+              tags$li(
+                strong("Drinking water treatment plants (DWTPs): "),
+                "Geocoded locations of community drinking water systems, including ",
+                "population served and primary source type (e.g., surface water, ",
+                "groundwater, mixed). These points are displayed as map markers."
+              )
+            ),
+            
+            h4("5. Climate and Economic Justice Screening Tool (CEJST)"),
+            tags$ul(
+              tags$li(
+                strong("CEJST tract-level indicators: "),
+                "Census-tract–level CEJST data, including demographic, economic, ",
+                "health, climate, and pollution burden indicators. These fields ",
+                "are joined to each tract and then intersected with the stream ",
+                "network to summarize wastewater influence by community."
+              )
+            ),
+            
+            h4("6. Processed intermediate tables"),
+            p(
+              "The following intermediate tables are generated within the analysis ",
+              "workflow and are not standalone external datasets, but are important ",
+              "for reproducibility:"
+            ),
+            tags$ul(
+              tags$li(
+                strong("Seasonal gage summary: "),
+                "Per-gage monthly mean, standard deviation, and low / high flow ",
+                "estimates used in the map popups."
+              ),
+              tags$li(
+                strong("WWTP monthly flows: "),
+                "Facility–COMID–month tables of effluent discharge (cfs) before ",
+                "downstream accumulation."
+              ),
+              tags$li(
+                strong("Tract-level wastewater influence summary: "),
+                "For each tract, the median, 90th percentile, and maximum % ",
+                "wastewater across all intersecting stream segments for each ",
+                "month and denominator source."
+              )
+            ),
+            
+            h4("Accessing the inputs"),
+            p(
+              "Public links and permanent DOIs for the processed inputs (e.g., ",
+              "Colorado-only flowlines, gage summaries, CEJST-joined tables) will ",
+              "be provided in the associated manuscript, data repository, or ",
+              "project website. This tab serves as a living data dictionary for ",
+              "interpreting those files."
             )
-          ),
-          h4("Wastewater accumulation (summary)"),
-          tags$ul(
-            tags$li(
-              "DMR-reported effluent flows are converted to cfs and averaged ",
-              "by facility, COMID, and month, collapsing multiple outfalls per ",
-              "facility–COMID combination."
+          )
+        )
+      )
+    ),
+    
+    # ================== TAB 6: DOWNLOADS & METHODS ===========================
+    tabPanel(
+      "Downloads & Methods",
+      fluidPage(
+        fluidRow(
+          column(
+            width = 8,
+            h3("Data & Methods"),
+            p(
+              "This tab will be updated to allow downloading of data for users to conduct their own analysis."
             ),
-            tags$li(
-              "Wastewater flows are summed for all WWTPs mapped to the same ",
-              "COMID and accumulated downstream using the NHDPlus flow network."
+            h4("Flow estimation and propagation (summary)"),
+            tags$ul(
+              tags$li(
+                "USGS daily streamflow records (post–2001) are aggregated to ",
+                "monthly means, with variability summarized using the interannual ",
+                "standard deviation and corresponding mean ± 1 SD bands (low/high) ",
+                "for each calendar month."
+              ),
+              tags$li(
+                "Each gage is mapped to its closest NHDPlus flowline (COMID); ",
+                "only one gage per COMID is retained, favoring the longest and ",
+                "most recent record."
+              ),
+              tags$li(
+                "Monthly flows are propagated downstream one segment at a time, ",
+                "scaled by the drainage-area ratio between segments ",
+                "(Q_downstream = Q_upstream × (A_downstream / A_upstream)^b, where b is ",
+                "a statewide exponent fitted to the gage network). Propagation continues ",
+                "only while drainage area changes by less than 50% (relative to the ",
+                "downstream segment) from one segment to the next, and stops at larger ",
+                "changes or at new gages."
+              ),
+              tags$li(
+                "At confluences, flows from multiple upstream branches that carry ",
+                "gage-based estimates are summed (mass balance). Segments downstream of ",
+                "a confluence are then subject to the same drainage-area gate as any ",
+                "other segment."
+              )
             ),
-            tags$li(
-              "For each segment and month, % wastewater is computed using ",
-              "either the gage-based or NHDPlus-based denominator."
+            h4("Wastewater accumulation (summary)"),
+            tags$ul(
+              tags$li(
+                "DMR-reported effluent flows are converted to cfs and averaged ",
+                "by facility, COMID, and month, collapsing multiple outfalls per ",
+                "facility–COMID combination."
+              ),
+              tags$li(
+                "Wastewater flows are summed for all WWTPs mapped to the same ",
+                "COMID and accumulated downstream using the NHDPlus flow network."
+              ),
+              tags$li(
+                "For each segment and month, % wastewater is computed using ",
+                "either the gage-based or NHDPlus-based denominator."
+              )
             )
           )
         )
@@ -590,21 +654,40 @@ ui <- tagList(
     )
   )
 )
-)
 
 # --- SERVER ------------------------------------------------------------------
 server <- function(input, output, session) {
   
-  # Helper
+  # helper
   `%||%` <- function(a, b) if (!is.null(a)) a else b
   
-  # ---- GAGES (markers; monthly stats) ---------------------------------------
-  safe_round <- function(x) ifelse(is.finite(x), round(x, 1), "NA")
-  pal        <- leaflet::colorNumeric(palette = "plasma", domain = c(0, 100), na.color = "transparent")
-  
-  usgs_gages_sf <- readRDS(paths$gages_rds)
-  
   selected_tract_id <- reactiveVal(NULL)
+  
+  # ---- Tract polygon clicks on the map --------------------------------------
+  observeEvent(input$map_feature_click, {
+    click <- input$map_feature_click
+    if (is.null(click)) return()
+    if (!identical(click$layer, "tracts")) return()
+    
+    # mapgl generates a numeric feature id, so read GEOID from properties
+    gid <- click$properties$GEOID
+    if (is.null(gid)) return()
+    if (!gid %in% tracts_info$GEOID) return()
+    
+    selected_tract_id(gid)
+  })
+  
+  contrib_block <- function(x) {
+    ifelse(!is.na(x) & nzchar(x),
+           paste0(
+             "<details><summary style='cursor:pointer; color:#1E90FF; font-weight:bold; text-decoration:underline;'>",
+             "Show WWTP Contributors</summary>",
+             "<div style='margin-left:10px;'>", x, "</div></details><br>"
+           ),
+           ""
+    )
+  }
+  
   # Column selector for map: which %WW column to use based on denominator source
   cols_for <- reactive({
     m <- input$month
@@ -617,7 +700,6 @@ server <- function(input, output, session) {
   
   filtered_flowlines <- reactive({ flowlines })
   
-  # ---- Precompute flowlines–CEJST join for equity tab ----------------------
   # Populate CEJST variable choices (numeric, non-percentile) + rurality
   observe({
     cejst_num_all <- names(cejst)[sapply(cejst, is.numeric)]
@@ -625,15 +707,15 @@ server <- function(input, output, session) {
     cejst_num_raw <- cejst_num_all[!grepl("percentile", cejst_num_all, ignore.case = TRUE) &
                                      !grepl("pct_", cejst_num_all, ignore.case = TRUE) &
                                      !grepl("_pct$", cejst_num_all, ignore.case = TRUE)]
-    cejst_num_raw <- setdiff(cejst_num_raw, "wastewater_pct")
+    cejst_num_raw <- cejst_num_raw[!grepl("wastewater", cejst_num_raw, ignore.case = TRUE)]
     if (length(cejst_num_raw) == 0) cejst_num_raw <- cejst_num_all
     
     if ("rurality" %in% names(cejst)) {
-      var_values <- c("rurality", cejst_num_raw)
-      var_labels <- c("Rurality", cejst_num_raw)
+      var_values <- c("rurality", cejst_lgl_cols, cejst_num_raw)
+      var_labels <- c("Rurality", paste0(cejst_lgl_cols, " (yes/no)"), cejst_num_raw)
     } else {
-      var_values <- cejst_num_raw
-      var_labels <- cejst_num_raw
+      var_values <- c(cejst_lgl_cols, cejst_num_raw)
+      var_labels <- c(paste0(cejst_lgl_cols, " (yes/no)"), cejst_num_raw)
     }
     
     updateSelectInput(
@@ -643,106 +725,16 @@ server <- function(input, output, session) {
     )
   })
   
-  
-  # ---- BASE MAP (Map tab) ----------------------------------------------------
-  output$map <- renderLeaflet({
-    leaflet::leaflet(options = leaflet::leafletOptions(preferCanvas = TRUE)) %>%
-      leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron, group = "Base") %>%
-      
-      leaflet::addPolygons(
-        data   = tracts_sf,
-        group  = "Census tracts",
-        layerId = ~GEOID,                 
-        weight = 0.5,
-        color  = "#999999",
-        opacity = 0.7,
-        fillColor   = "#f0f0f0",
-        fillOpacity = 0.2,
-        highlightOptions = leaflet::highlightOptions(
-          weight = 2,
-          color  = "#555555",
-          fillOpacity = 0.35,
-          bringToFront = FALSE           # keep streams/markers on top even when highlighted
-        )
-      ) %>%
-      
-      leaflet::addCircleMarkers(
-        data  = geocoded_dwtp,
-        lng   = ~Longitude, lat = ~Latitude,
-        popup = ~paste0("<b>", `PWS Name`, "</b><br>Pop: ", `Population Served`,
-                        "<br>Source: ", `Primary Source`),
-        radius = 6, color = "blue", fillOpacity = 0.8, group = "DWTP"
-      ) %>%
-      leaflet::addCircleMarkers(
-        data  = wwtp_pts,
-        popup = ~paste0("<b>", Facility, "</b><br>Design Flow: ", DesignFlow, " MGD"),
-        radius = 6, color = "brown", fillOpacity = 0.8, group = "WWTP"
-      ) %>%
-      leaflet::addCircleMarkers(
-        data   = usgs_gages_sf,
-        radius = 5, color = "black", fillOpacity = 1, stroke = TRUE, weight = 1,
-        label  = ~station_nm,
-        popup  = ~popup_str,
-        group  = "USGS Gages"
-      ) %>%
-      leaflet::addLayersControl(
-        overlayGroups = c("Streams","DWTP","WWTP","USGS Gages"),
-        options = leaflet::layersControlOptions(collapsed = TRUE, autoZIndex = TRUE)
-      )
-  })
-  
-  observeEvent(input$reset_map, {
-    bb <- sf::st_bbox(flowlines)
-    leaflet::leafletProxy("map") %>%
-      leaflet::fitBounds(
-        lng1 = bb["xmin"], lat1 = bb["ymin"],
-        lng2 = bb["xmax"], lat2 = bb["ymax"]
-      )
-  })
-  
-  # ---- Track clicks on census tract polygons --------------------------------
-  observeEvent(input$map_shape_click, {
-    click <- input$map_shape_click
-    # For polygons, click$id will be the layerId we set (~GEOID)
-    if (is.null(click$id)) return()
-    
-    # Only respond if the ID matches a tract GEOID
-    if (click$id %in% tracts_sf$GEOID) {
-      selected_tract_id(click$id)
-    }
-  })
-  
-  observeEvent(list(input$src, input$month), {
+  # ---- STREAMS: colors + popups for the current month / denominator ---------
+  streams_layer_data <- reactive({
     spec <- cols_for()
     dat  <- filtered_flowlines()
     m    <- input$month
     mlab <- month_labels[m]
     
-    # --- identify %WW column + impacted segments --------------------------
-    vals <- suppressWarnings(as.numeric(dat[[spec$pct]]))
+    vals     <- dat[[spec$pct]]
+    ww_color <- ifelse(is.na(vals), "#d9d9d9", pal(vals))
     
-    # impacted = finite %WW > 0
-    impacted <- is.finite(vals) & !is.na(vals) & vals > 0
-    
-    # if nothing is impacted for this month/source, just clear streams + legend
-    if (!any(impacted)) {
-      proxy <- leaflet::leafletProxy("map") %>%
-        leaflet::clearGroup("Streams") %>%
-        leaflet::removeControl("pctLegend") %>%
-        leaflet::removeControl("symbolLegend")
-      
-      # (optional) you could add a small control saying "No impacted segments".
-      return(invisible(NULL))
-    }
-    
-    # keep ONLY impacted segments
-    dat  <- dat[impacted, , drop = FALSE]
-    vals <- vals[impacted]
-    
-    # color only for impacted segments
-    dat$._color <- pal(vals)
-    
-    # --- Build popup text only for impacted segments ----------------------
     if (input$src == "Gage-based") {
       ww_mean_col <- paste0("WW_cum_mean_", m)
       ww_low_col  <- paste0("WW_cum_low_",  m)
@@ -753,7 +745,8 @@ server <- function(input, output, session) {
       pct_min_col  <- paste0("pct_min_",  m)
       pct_max_col  <- paste0("pct_max_",  m)
       
-      dat$popup_tmp <- paste0(
+      popup_html <- paste0(
+        "<b>Hydroseq:</b> ", dat$Hydroseq, "<br><br>",
         "<b>", mlab, " WW Flow (mean±sd):</b> ",
         safe_round(dat[[ww_mean_col]]), " cfs",
         " (sd ", safe_round(dat[[sd_col]]),
@@ -770,90 +763,189 @@ server <- function(input, output, session) {
         ifelse(!is.na(dat$gage_used),
                paste0("<b>Gage used:</b> ", dat$gage_used, "<br>"), ""),
         ifelse(!is.na(dat$flow_source),
-               paste0("<b>Flow source:</b> ", dat$flow_source, "<br>"), "")
+               paste0("<b>Flow source:</b> ", dat$flow_source, "<br>"), ""),
+        contrib_block(dat[[paste0("contributors_html_", m)]])
       )
     } else {
       q_nhd_col    <- paste0("QE_", m, "_nhd")
       pct_mean_nhd <- paste0("pct_mean_", m, "_nhd")
       
-      dat$popup_tmp <- paste0(
+      popup_html <- paste0(
+        "<b>Hydroseq:</b> ", dat$Hydroseq, "<br><br>",
         "<b>", mlab, " NHDPlus flow:</b> ",
         safe_round(dat[[q_nhd_col]]), " cfs<br><br>",
         "<b>", mlab, " % Wastewater (NHDPlus-based):</b><br>",
-        "mean: ", safe_round(dat[[pct_mean_nhd]]), "%<br><br>"
+        "mean: ", safe_round(dat[[pct_mean_nhd]]), "%<br><br>",
+        contrib_block(dat[[paste0("contributors_html_", m)]])
       )
     }
     
-    # --- Strip data to just what Leaflet needs  ------------------------------
-    dat_leaf <- dat %>%
-      dplyr::select(
-        Hydroseq,
-        QE_MA,
-        ._color,
-        popup_tmp
-      )
-    
-    proxy <- leaflet::leafletProxy("map") %>%
-      leaflet::clearGroup("Streams") %>%
-      leaflet::removeControl("pctLegend") %>%
-      leaflet::removeControl("symbolLegend") %>%
-      leaflet::addPolylines(
-        data   = dat_leaf,
-        weight = ~scales::rescale(log1p(QE_MA), to = c(0.2, 4)),
-        color  = ~._color,
-        opacity = 0.85,
-        popup   = ~popup_tmp,
-        popupOptions = leaflet::popupOptions(maxWidth = 600),
-        group   = "Streams"
-      )
-    
-    # Continuous legend for %WW colors 
-    proxy <- proxy %>%
-      leaflet::addLegend(
-        position = "bottomright",
-        pal      = pal,
-        values   = c(0, 100),
-        title    = paste0("% Wastewater (", input$src, ", ", mlab, ")"),
-        opacity  = 1,
-        labFormat = leaflet::labelFormat(suffix = "%"),
-        layerId  = "pctLegend"
-      )
-    
-    # Updated symbol legend: note that only impacted segments are drawn
-    symbol_legend_html <- HTML(
-      "<div style='background: white; padding: 6px 8px; font-size: 12px;
-                 box-shadow: 0 0 10px rgba(0,0,0,0.2);'>
-       <b>Map symbols</b><br>
-       <div>
-         <span style='display:inline-block; width:10px; height:10px;
-                      border-radius:50%; background:blue; margin-right:6px;'></span>
-         Drinking water treatment plant (DWTP)
-       </div>
-       <div>
-         <span style='display:inline-block; width:10px; height:10px;
-                      border-radius:50%; background:brown; margin-right:6px;'></span>
-         Wastewater treatment plant (WWTP)
-       </div>
-       <div>
-         <span style='display:inline-block; width:10px; height:10px;
-                      border-radius:50%; background:black; margin-right:6px;'></span>
-         USGS gage
-       </div>
-       <div style='margin-top:4px;'>
-         Only stream segments with wastewater contribution (%WW &gt; 0) are shown.
-       </div>
-     </div>"
+    sf::st_sf(
+      data.frame(
+        hydroseq   = dat$Hydroseq,
+        pct        = vals,
+        ww_color   = ww_color,
+        line_w     = scales::rescale(log1p(dat$QE_MA), to = c(0.2, 4)),
+        popup_html = popup_html,
+        stringsAsFactors = FALSE
+      ),
+      geometry = sf::st_geometry(dat)
     )
-    
-    proxy %>%
-      leaflet::addControl(
-        html     = symbol_legend_html,
-        position = "bottomleft",
-        layerId  = "symbolLegend"
+  })
+  
+  pct_legend_title <- function(src, m) {
+    paste0("% Wastewater (", src, ", ", month_labels[m], ")")
+  }
+  
+  # Custom HTML legend with circle markers
+  symbol_legend_html <-
+    "<div style='background: white; padding: 6px 8px; font-size: 12px;
+               box-shadow: 0 0 10px rgba(0,0,0,0.2);'>
+     <b>Map symbols</b><br>
+     <div>
+       <span style='display:inline-block; width:10px; height:10px;
+                    border-radius:50%; background:blue; margin-right:6px;'></span>
+       Drinking water treatment plant (DWTP)
+     </div>
+     <div>
+       <span style='display:inline-block; width:10px; height:10px;
+                    border-radius:50%; background:brown; margin-right:6px;'></span>
+       Wastewater treatment plant (WWTP)
+     </div>
+     <div>
+       <span style='display:inline-block; width:10px; height:10px;
+                    border-radius:50%; background:black; margin-right:6px;'></span>
+       USGS gage
+     </div>
+     <div style='margin-top:4px;'>
+       <span style='display:inline-block; width:20px; height:3px;
+                    background:#d9d9d9; margin-right:6px;'></span>
+       Stream with no %WW data
+     </div>
+   </div>"
+  
+  # ---- BASE MAP --------------------------------------------------------------
+  output$map <- renderMaplibre({
+    mapgl::maplibre(
+      style = mapgl::openfreemap_style("positron")
+    ) %>%
+      mapgl::fit_bounds(flowlines, animate = FALSE) %>%
+      mapgl::add_navigation_control(position = "top-right") %>%
+      mapgl::add_scale_control(position = "bottom-left") %>%
+      
+      # --- Census tract polygons
+      mapgl::add_fill_layer(
+        id = "tracts",
+        source = tracts_map,
+        fill_color = "#CCCCCC",
+        fill_opacity = 0.15,
+        fill_outline_color = "#666666",
+        hover_options = list(fill_color = "#000000", fill_opacity = 0.35),
+        popup = "popup_html"
+      ) %>%
+      
+      # --- Streams (isolate() so month/source changes go through the proxy below)
+      mapgl::add_line_layer(
+        id = "streams",
+        source = isolate(streams_layer_data()),
+        line_color = mapgl::get_column("ww_color"),
+        line_width = mapgl::get_column("line_w"),
+        line_opacity = 0.85,
+        popup = "popup_html"
+      ) %>%
+      
+      # --- DWTP markers
+      mapgl::add_circle_layer(
+        id = "dwtp",
+        source = dwtp_map,
+        circle_color = "blue",
+        circle_radius = 6,
+        circle_opacity = 0.8,
+        popup = "popup_html",
+        tooltip = "pws_name"
+      ) %>%
+      
+      # --- WWTP markers
+      mapgl::add_circle_layer(
+        id = "wwtp",
+        source = wwtp_map,
+        circle_color = "brown",
+        circle_radius = 6,
+        circle_opacity = 0.8,
+        popup = "popup_html",
+        tooltip = "facility"
+      ) %>%
+      
+      # --- USGS gages
+      mapgl::add_circle_layer(
+        id = "gages",
+        source = gages_map,
+        circle_color = "black",
+        circle_radius = 5,
+        circle_opacity = 1,
+        circle_stroke_color = "#ffffff",
+        circle_stroke_width = 1,
+        popup = "popup_str",
+        tooltip = "station_nm"
+      ) %>%
+      
+      # --- Controls
+      mapgl::add_layers_control(
+        position = "top-left",
+        layers = list(
+          "Streams"       = "streams",
+          "DWTP"          = "dwtp",
+          "WWTP"          = "wwtp",
+          "USGS Gages"    = "gages",
+          "Census tracts" = "tracts"
+        ),
+        collapsible = TRUE
+      ) %>%
+      mapgl::add_legend(
+        legend_title = pct_legend_title(isolate(input$src), isolate(input$month)),
+        values = c("0%", "100%"),
+        colors = pal(seq(0, 100, length.out = 11)),
+        type = "continuous",
+        position = "bottom-right",
+        unique_id = "pctLegend"
+      ) %>%
+      mapgl::add_control(
+        html = symbol_legend_html,
+        position = "bottom-left",
+        id = "symbolLegend"
       )
   })
   
-  # ================= SEASONALITY TAB LOGIC ===================================
+  observeEvent(input$reset_map, {
+    mapgl::maplibre_proxy("map") %>%
+      mapgl::fit_bounds(flowlines, animate = TRUE)
+  })
+  
+  # --- Recolor and repopulate streams when the dropdowns change ---------------
+  observeEvent(list(input$src, input$month), {
+    mapgl::maplibre_proxy("map") %>%
+      mapgl::clear_layer("streams") %>%
+      mapgl::add_line_layer(
+        id           = "streams",
+        source       = streams_layer_data(),
+        line_color   = mapgl::get_column("ww_color"),
+        line_width   = mapgl::get_column("line_w"),
+        line_opacity = 0.85,
+        popup        = "popup_html",
+        before_id    = "dwtp"   # keep streams under the point layers
+      ) %>%
+      mapgl::clear_legend("pctLegend") %>%
+      mapgl::add_legend(
+        legend_title = pct_legend_title(input$src, input$month),
+        values       = c("0%", "100%"),
+        colors       = pal(seq(0, 100, length.out = 11)),
+        type         = "continuous",
+        position     = "bottom-right",
+        unique_id    = "pctLegend"
+      )
+  }, ignoreInit = TRUE)
+  
+  # ================= SEASONALITY TAB LOGIC ====================
   season_cols_for <- reactive({
     src <- input$season_src %||% "Gage-based"
     list(
@@ -875,9 +967,7 @@ server <- function(input, output, session) {
     req(dat)
     
     cols <- season_cols_for()
-    
     use_tracts <- isTRUE(input$season_use_tracts)
-    unit_lab   <- ifelse(use_tracts, "tracts", "segments")
     
     # long: keep BOTH GEOID and Hydroseq to switch units safely
     long <- dplyr::bind_rows(lapply(mon_codes, function(mm) {
@@ -897,7 +987,6 @@ server <- function(input, output, session) {
     }))
     req(nrow(long) > 0)
     
-    # choose unit id
     long <- long %>%
       dplyr::mutate(unit_id = if (use_tracts) GEOID else as.character(Hydroseq))
     
@@ -923,7 +1012,7 @@ server <- function(input, output, session) {
       dplyr::filter(ever_impacted)
     
     # monthly summary (median + IQR) among ever-impacted units, zeros retained
-    out <- long_imp %>%
+    long_imp %>%
       dplyr::group_by(mon_code, month) %>%
       dplyr::summarise(
         n_units_total = dplyr::n_distinct(unit_id),
@@ -937,10 +1026,9 @@ server <- function(input, output, session) {
         mon_code = factor(mon_code, levels = mon_codes),
         month    = factor(month, levels = unname(month_labels[mon_codes]))
       )
-    
-    out
   })
   
+  # Cached by inputs: the bootstrap CIs are the slow part
   season_stats <- reactive({
     dat <- season_base()
     req(dat)
@@ -969,7 +1057,7 @@ server <- function(input, output, session) {
       ) %>%
       dplyr::mutate(pct = dplyr::if_else(is.finite(pct), pct, NA_real_))
     
-    # ever-impacted 
+    # ever-impacted membership
     ever_imp <- long %>%
       dplyr::group_by(unit_id) %>%
       dplyr::summarise(ever_impacted = any(!is.na(pct) & pct > 0, na.rm = TRUE), .groups = "drop")
@@ -988,12 +1076,31 @@ server <- function(input, output, session) {
     X <- as.matrix(wide_cc[, mon_codes, drop = FALSE])
     fried <- stats::friedman.test(X)
     
+    # county of each unit (tract GEOID digits 1-5; for segments use the first tract it touches)
+    cty <- if (use_tracts) {
+      substr(as.character(wide_cc$unit_id), 1, 5)
+    } else {
+      substr(as.character(dat$GEOID[match(wide_cc$unit_id, as.character(dat$Hydroseq))]), 1, 5)
+    }
+    cty[is.na(cty)] <- "NA"
+    groups <- split(seq_along(cty), cty)
+    
+    # ---- Kendall's W with county-resampled 95% CI ---------------------------
+    k  <- ncol(X)
+    R  <- t(apply(X, 1, rank))
+    Tv <- apply(X, 1, function(r) { tt <- table(r); sum(tt^3 - tt) })
+    W  <- eq_w_calc(R, Tv, k, seq_len(nrow(X)))
+    W_boot <- replicate(300, eq_w_calc(R, Tv, k, eq_boot_idx(groups)))
+    W_ci   <- stats::quantile(W_boot, c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+    
+    # ---- pairwise paired tests + rank-biserial effect size ------------------
     pairs <- combn(mon_codes, 2, simplify = FALSE)
     pw <- lapply(pairs, function(p) {
-      a <- wide_cc[[p[1]]]; b <- wide_cc[[p[2]]]
+      a <- X[, p[1]]; b <- X[, p[2]]
       wt <- stats::wilcox.test(a, b, paired = TRUE, exact = FALSE)
       data.frame(m1 = p[1], m2 = p[2],
                  med_diff = stats::median(a - b, na.rm = TRUE),
+                 rb = eq_rb_paired(a, b),
                  p_value = wt$p.value,
                  stringsAsFactors = FALSE)
     }) %>% dplyr::bind_rows()
@@ -1006,111 +1113,12 @@ server <- function(input, output, session) {
       med      = apply(X, 2, stats::median, na.rm = TRUE)
     ) %>% dplyr::arrange(dplyr::desc(med))
     
-    list(n = nrow(wide_cc), friedman = fried, pairwise = pw, month_meds = month_meds)
-  })
-  
-  # ---- Selected census tract info panel -------------------------------------
-  output$tract_info <- renderPrint({
-    gid <- selected_tract_id()
-    
-    if (is.null(gid)) {
-      cat("Click a census tract polygon to see tract-level stats.\n")
-      return(invisible(NULL))
-    }
-    
-    row <- tracts_sf[tracts_sf$GEOID == gid, , drop = FALSE]
-    if (nrow(row) == 0) {
-      cat("Selected tract not found in tract dataset.\n")
-      return(invisible(NULL))
-    }
-    
-    # helper: format percentages
-    fmt_pct <- function(x) {
-      if (is.null(x) || is.na(x)) return("NA")
-      val <- as.numeric(x)
-      if (is.na(val)) return("NA")
-      # assume 0–1 → convert to %
-      if (val <= 1) val <- val * 100
-      paste0(round(val, 1), "%")
-    }
-    
-    # ===== BASIC TRACT METADATA =====
-    cat("Census tract:", gid, "\n")
-    
-    if ("rurality" %in% names(row)) {
-      cat("Rurality: ", as.character(row$rurality), "\n", sep = "")
-    }
-    if ("Total population" %in% names(row)) {
-      cat("Total population: ", row$`Total population`, "\n", sep = "")
-    }
-    if ("Percent age over 64" %in% names(row)) {
-      cat("Percent age over 64: ", fmt_pct(row$`Percent age over 64`), "\n", sep = "")
-    }
-    if ("Percent White" %in% names(row)) {
-      cat("Percent White: ", fmt_pct(row$`Percent White`), "\n", sep = "")
-    }
-    
-    poverty_col <- "Percentage households below 100% of federal poverty line in 2009 (island areas) and 2010 (states and PR)"
-    
-    if (poverty_col %in% names(row)) {
-      cat(
-        "Percentage of households below 100% of federal poverty line in 2010: ",
-        fmt_pct(row[[poverty_col]]), "\n",
-        sep = ""
-      )
-    }
-    
-    cat("\n")
-    
-    # ===== MEDIAN %WW FOR THIS TRACT, MONTH, DENOMINATOR =====
-    # Use fl_cejst, which has segment-level %WW + GEOID
-    src_now <- input$src %||% "Gage-based"    # Map tab denominator
-    mon_now <- input$month                    # "01".."12"
-    
-    pct_col <- if (identical(src_now, "Gage-based")) {
-      paste0("pct_mean_", mon_now)
-    } else {
-      paste0("pct_mean_", mon_now, "_nhd")
-    }
-    
-    if (!pct_col %in% names(fl_cejst)) {
-      cat("No %WW column found for this month/source (", pct_col, ").\n", sep = "")
-      return(invisible(NULL))
-    }
-    
-    segs <- fl_cejst %>%
-      dplyr::filter(GEOID == gid)
-    
-    if (nrow(segs) == 0) {
-      cat("No stream segments mapped to this tract.\n")
-      return(invisible(NULL))
-    }
-    
-    pct_vals <- suppressWarnings(as.numeric(segs[[pct_col]]))
-    impacted <- is.finite(pct_vals) & !is.na(pct_vals) & pct_vals > 0
-    
-    n_total    <- length(pct_vals)
-    n_impacted <- sum(impacted, na.rm = TRUE)
-    
-    cat("Stream segments in tract (for month ", mon_now, "):\n", sep = "")
-    cat("  Total segments:   ", n_total, "\n", sep = "")
-    cat("  Impacted segments:", n_impacted, " (", 
-        ifelse(n_total > 0, fmt_pct(n_impacted / n_total), "NA"), 
-        " of segments)\n", sep = "")
-    
-    if (n_impacted == 0) {
-      cat("  Median %WW: NA (no impacted segments this month for this denominator)\n")
-      return(invisible(NULL))
-    }
-    
-    med_pct <- stats::median(pct_vals[impacted], na.rm = TRUE)
-    
-    denom_lab <- if (identical(src_now, "Gage-based")) "gage-based" else "NHDPlus-based"
-    
-    cat("  Median %WW among impacted segments (",
-        denom_lab, ", ", month_labels[mon_now], "): ",
-        round(med_pct, 1), "%\n", sep = "")
-  })
+    list(n = nrow(wide_cc), n_counties = length(groups),
+         friedman = fried, pairwise = pw, month_meds = month_meds,
+         W = W, W_lo = W_ci[1], W_hi = W_ci[2],
+         X = X, groups = groups)
+  }) %>%
+    bindCache(input$season_src, input$season_rurality, input$season_use_tracts)
   
   output$season_stats_text <- renderPrint({
     s <- season_stats()
@@ -1124,15 +1132,17 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
     
-    # 1) Overall test
-    cat(sprintf("Complete paired units (n_complete): %d\n", s$n))
+    # Overall test + how consistent the seasonal pattern is
+    cat(sprintf("Complete paired units (n_complete): %d %s in %d counties\n", s$n, unit_lab, s$n_counties))
     cat("Overall seasonality (Friedman):\n")
-    cat(sprintf("  chi-squared = %.3f, df = %d, p = %s\n\n",
+    cat(sprintf("  chi-squared = %.3f, df = %d, p = %s\n",
                 unname(s$friedman$statistic),
                 unname(s$friedman$parameter),
                 format.pval(s$friedman$p.value, digits = 2, eps = 1e-100)))
+    cat(sprintf("  Kendall's W = %.2f (95%% CI %.2f to %.2f)\n\n", s$W, s$W_lo, s$W_hi))
+    cat("  W: 0 = no shared seasonal pattern across units, 1 = every unit ranks the months identically.\n\n")
     
-    # 2) Ranked months by median
+    # Ranked months by median
     top_n <- 4
     bot_n <- 4
     cat("Highest months by median %WW :\n")
@@ -1140,7 +1150,7 @@ server <- function(input, output, session) {
     cat("\nLowest months by median %WW:\n")
     print(utils::tail(s$month_meds, bot_n), row.names = FALSE)
     
-    # 3) Only show “meaningful” significant pairwise differences
+    # Only show significant pairwise differences
     pw <- s$pairwise %>%
       dplyr::mutate(
         sig = !is.na(p_adj_BH) & p_adj_BH < 0.05,
@@ -1157,13 +1167,22 @@ server <- function(input, output, session) {
     }
     
     show_n <- min(8, nrow(pw))
+    pw <- utils::head(pw, show_n)
     
     cat(sprintf(
       "Top significant month-to-month differences (BH-adjusted p < 0.05; showing %d):\n",
       show_n
     ))
     
-    # Update month labels (01 -> Jan)
+    # Bootstrap 95% CI for the rank-biserial, only for the rows shown (resamples whole counties)
+    ci <- t(vapply(seq_len(nrow(pw)), function(i) {
+      bs <- replicate(200, {
+        idx <- eq_boot_idx(s$groups)
+        eq_rb_paired(s$X[idx, pw$m1[i]], s$X[idx, pw$m2[i]])
+      })
+      stats::quantile(bs, c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+    }, numeric(2)))
+    
     mm_to_abb <- function(mm) month.abb[as.integer(mm)]
     
     out <- pw %>%
@@ -1171,23 +1190,24 @@ server <- function(input, output, session) {
         month1   = mm_to_abb(m1),
         month2   = mm_to_abb(m2),
         med_diff = round(med_diff, 2),
+        rank_biserial = round(rb, 2),
+        rb_95CI  = sprintf("%.2f to %.2f", ci[, 1], ci[, 2]),
         p_adj_BH_fmt = ifelse(
           p_adj_BH < 1e-100,
           "< 1e-100",
           formatC(p_adj_BH, format = "e", digits = 2)
         )
       ) %>%
-      dplyr::select(month1, month2, med_diff, p_adj_BH = p_adj_BH_fmt) %>%
-      utils::head(show_n)
+      dplyr::select(month1, month2, med_diff, rank_biserial, rb_95CI, p_adj_BH = p_adj_BH_fmt)
     
-    print(out, row.names = FALSE)
+    print(as.data.frame(out), row.names = FALSE)
     
     cat("\nNotes:\n")
     cat("  med_diff = median(month1 - month2) across the same units (paired).\n")
+    cat("  rank_biserial: -1 to +1 effect size (positive = month1 higher in most units). Roughly: 0.1 small, 0.3 medium, 0.5 large.\n")
+    cat("  95% CIs resample whole counties, because tracts in a county are not independent.\n")
     cat("  BH-adjusted p-values control false discovery rate across many pairwise tests.\n")
   })
-  
-  season_monthly <- shiny::debounce(season_monthly, 400)
   
   output$season_plot_median <- renderPlot({
     df <- season_monthly()
@@ -1196,26 +1216,20 @@ server <- function(input, output, session) {
     src_lab  <- ifelse((input$season_src %||% "Gage-based") == "Gage-based", "gage-based", "NHDPlus-based")
     unit_lab <- ifelse(isTRUE(input$season_use_tracts), "tracts", "segments")
     
-    # y-limit with a bit of headroom
     ymax <- max(df$hi_iqr, na.rm = TRUE)
     
     ggplot(df, aes(x = mon_code, y = med_pct, group = 1)) +
-      # IQR ribbon: one neutral fill for all months (no varying aesthetics here)
       geom_ribbon(
         aes(ymin = lo_iqr, ymax = hi_iqr),
         fill  = "grey85",
         alpha = 0.4,
         color = NA
       ) +
-      # Seasonal colors for line + points
       geom_line(aes(color = mon_code), linewidth = 1.1) +
       geom_point(aes(color = mon_code), size = 2.8) +
-      
       scale_x_discrete(labels = setNames(month.abb, mon_codes)) +
       scale_color_manual(values = month_colors, guide = "none") +
-      
       coord_cartesian(ylim = c(0, ymax * 1.12)) +
-      
       labs(
         x = "Month",
         y = paste0("Median %WW ", unit_lab, "; zeros retained)"),
@@ -1223,14 +1237,8 @@ server <- function(input, output, session) {
         subtitle = paste0("Shaded band: IQR (25–75%) ", unit_lab)
       ) +
       theme_app() +
-      theme(
-        axis.text.x = element_text(
-          angle = 0,
-          hjust = 0.5
-        )
-      )
+      theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
   })
-  
   
   output$season_text <- renderPrint({
     df <- season_monthly()
@@ -1253,7 +1261,6 @@ server <- function(input, output, session) {
     cat(sprintf("  %s (%s): median %.1f%% (IQR %.1f–%.1f%%)\n",
                 as.character(peak_med$month), as.character(peak_med$mon_code),
                 peak_med$med_pct, peak_med$lo_iqr, peak_med$hi_iqr))
-    
   })
   
   # ---- Download: Seasonality data -----------------
@@ -1265,14 +1272,12 @@ server <- function(input, output, session) {
       df <- season_monthly()
       req(df)
       
-      # Add context columns (denominator, rurality filter, unit type)
       df_out <- df %>%
         mutate(
           denominator_source = input$season_src %||% "Gage-based",
           rurality_filter    = input$season_rurality %||% "All",
           unit_type          = if (isTRUE(input$season_use_tracts)) "tract" else "segment"
         ) %>%
-        # move context columns to front
         select(denominator_source, rurality_filter, unit_type, everything())
       
       readr::write_csv(df_out, file)
@@ -1285,7 +1290,7 @@ server <- function(input, output, session) {
     req(input$cejst_month)
     m <- input$cejst_month
     
-    # Only used for Severity; default safely if not present
+    # Only used for Severity
     src <- input$cejst_src %||% "Gage-based"
     
     if (identical(src, "Gage-based")) {
@@ -1304,7 +1309,7 @@ server <- function(input, output, session) {
     
     dat <- fl_cejst
     
-    # Filter by rurality if requested
+    # Filter by rurality
     if (!is.null(input$rurality) && input$rurality != "All") {
       if ("rurality" %in% names(dat)) {
         dat <- dplyr::filter(dat, rurality == input$rurality)
@@ -1315,8 +1320,13 @@ server <- function(input, output, session) {
     
     dat <- dplyr::filter(dat, !is.na(GEOID))
     
-    # numeric CEJST columns from original cejst object
-    cejst_num_cols <- names(cejst)[sapply(cejst, is.numeric)]
+    # log10 drainage area per segment (non-finite -> NA)
+    dat$lDA <- suppressWarnings(log10(as.numeric(dat$TotDASqKM)))
+    dat$lDA[!is.finite(dat$lDA)] <- NA_real_
+    
+    # numeric + boolean CEJST columns from original cejst object
+    cejst_num_cols <- c(names(cejst)[sapply(cejst, is.numeric)], cejst_lgl_cols)
+    cejst_num_cols <- intersect(cejst_num_cols, names(dat))
     
     # ---- PREVALENCE: tract has ANY impacted segment (0/1) -------------------
     if (identical(input$cejst_mode, "Prevalence")) {
@@ -1334,6 +1344,8 @@ server <- function(input, output, session) {
         dplyr::summarise(
           any_impacted = as.integer(any(impacted, na.rm = TRUE)),
           metric_value = any_impacted, # 0/1 per tract
+          lDA   = suppressWarnings(stats::median(lDA, na.rm = TRUE)),  # all segments in the tract
+          lnseg = log(dplyr::n()),
           dplyr::across(
             dplyr::all_of(cejst_num_cols),
             ~ dplyr::first(.x),
@@ -1341,6 +1353,10 @@ server <- function(input, output, session) {
           ),
           rurality = dplyr::first(rurality),
           .groups = "drop"
+        ) %>%
+        dplyr::mutate(
+          lDA    = ifelse(is.finite(lDA), lDA, NA_real_),
+          county = substr(as.character(GEOID), 1, 5)
         )
       
       return(out)
@@ -1372,502 +1388,501 @@ server <- function(input, output, session) {
         .groups = "drop"
       )
     
-    dat_imp <- dat_sev %>%
-      dplyr::filter(impacted)
-    
-    sev_vals <- dat_imp %>%
+    sev_vals <- dat_sev %>%
+      dplyr::filter(impacted) %>%
       dplyr::group_by(GEOID) %>%
       dplyr::summarise(
         metric_value = stats::median(pct, na.rm = TRUE),
+        lDA          = suppressWarnings(stats::median(lDA, na.rm = TRUE)),  # impacted segments only
         .groups = "drop"
       )
     
-    out <- tract_base %>%
-      dplyr::inner_join(sev_vals, by = "GEOID")
-    
-    out
+    tract_base %>%
+      dplyr::inner_join(sev_vals, by = "GEOID") %>%
+      dplyr::mutate(
+        lDA    = ifelse(is.finite(lDA), lDA, NA_real_),
+        county = substr(as.character(GEOID), 1, 5)
+      )
   })
   
-  # Create bins (shared for prevalence/severity)
-  cejst_binned_raw <- reactive({
+  # Tract table for yes/no and Rurality indicators, with a Yes/No or Urban/Rural group column
+  cejst_cat_df <- reactive({
     tab <- cejst_summary()
-    req(tab)
-    
     var <- input$cejst_var_box
-    req(var)
-    
-    # --- Rurality path (categorical bins) ---
+    req(tab, var, is_cat_var(var))
     if (identical(var, "rurality")) {
-      req("rurality" %in% names(tab))
-      
-      df <- tab %>%
-        dplyr::select(GEOID, metric_value, rurality) %>%
-        dplyr::filter(is.finite(metric_value), !is.na(rurality))
-      
-      df$var_bin <- factor(df$rurality, levels = c("Urban", "Rural"))
-      return(df)
-      
+      tab %>%
+        dplyr::filter(is.finite(metric_value), !is.na(rurality)) %>%
+        dplyr::transmute(GEOID, metric_value, grp = factor(rurality, levels = c("Urban", "Rural")))
+    } else {
+      req(var %in% names(tab))
+      tab %>%
+        dplyr::transmute(GEOID, metric_value, v = .data[[var]]) %>%
+        dplyr::filter(is.finite(metric_value), !is.na(v)) %>%
+        dplyr::mutate(grp = factor(ifelse(v, "Yes", "No"), levels = c("No", "Yes"))) %>%
+        dplyr::select(GEOID, metric_value, grp)
     }
-    
-    # --- Numeric CEJST variable path ---
-    req(var %in% names(tab))
-    
-    df <- tab %>%
-      dplyr::transmute(
-        GEOID,
-        metric_value,
-        var_value = suppressWarnings(as.numeric(.data[[var]]))
-      ) %>%
-      dplyr::filter(is.finite(metric_value), is.finite(var_value))
-    
-    req(nrow(df) > 0)
-    
-    # Clamp bins to something valid
-    cur_nb <- input$cejst_nbins %||% 4L
-    nb     <- max(2L, min(6L, as.integer(cur_nb)))
-    
-    n_uniq <- dplyr::n_distinct(df$var_value)
-    if (n_uniq <= 1) {
-      df$var_bin <- factor("All tracts")
-      return(df)
-    }
-    
-    nb_eff <- min(nb, n_uniq)
-    
-    # bin by rank -> stable bins even with ties
-    df <- df %>%
-      dplyr::mutate(
-        .r      = dplyr::dense_rank(var_value),
-        .bin_id = dplyr::ntile(.r, nb_eff)
-      )
-    
-    # label bins by actual value ranges
-    lab_tbl <- df %>%
-      dplyr::group_by(.bin_id) %>%
-      dplyr::summarise(
-        lo = min(var_value, na.rm = TRUE),
-        hi = max(var_value, na.rm = TRUE),
-        .groups = "drop"
-      ) %>%
-      dplyr::arrange(.bin_id) %>%
-      dplyr::mutate(
-        label = if (var %in% proportion_cols) {
-          paste0("[", round(lo * 100, 0), ", ", round(hi * 100, 0), "]")
-        } else {
-          paste0("[", round(lo, 1), ", ", round(hi, 1), "]")
-        },
-        label = dplyr::if_else(.bin_id == 1, paste0(label, " (lowest)"), label),
-        label = dplyr::if_else(.bin_id == dplyr::n(), paste0(label, " (highest)"), label)
-      )
-    
-    # Make sure levels are unique (avoid duplicated factor level error)
-    lab_levels <- unique(lab_tbl$label)
-    
-    df <- df %>%
-      dplyr::left_join(
-        lab_tbl %>% dplyr::select(.bin_id, label),
-        by = ".bin_id"
-      ) %>%
-      dplyr::mutate(
-        var_bin = factor(label, levels = lab_levels)
-      ) %>%
-      dplyr::select(GEOID, metric_value, var_bin)
-    
-    df
   })
   
-  # Debounce to avoid recomputing during rapid slider / selector changes
-  cejst_binned <- shiny::debounce(cejst_binned_raw, 400)
+  # Indicators offered in the dropdown
+  cejst_ind_cols <- function() {
+    all_num <- names(cejst)[sapply(cejst, is.numeric)]
+    raw <- all_num[!grepl("percentile", all_num, ignore.case = TRUE) &
+                     !grepl("pct_", all_num, ignore.case = TRUE) &
+                     !grepl("_pct$", all_num, ignore.case = TRUE)]
+    raw <- raw[!grepl("wastewater", raw, ignore.case = TRUE)]
+    if (length(raw) == 0) raw <- all_num
+    c(if ("rurality" %in% names(cejst)) "rurality", cejst_lgl_cols, raw)
+  }
   
-  # ---- Dynamic max bins for slider (mode-specific, and respects label merging) ----
-  observeEvent({
-    list(
-      input$cejst_var_box,
-      input$cejst_mode,
-      input$cejst_month,
-      input$rurality,
-      input$cejst_src
+  # Effect sizes for ALL indicators for the current mode / month / source / rurality filter.
+  # Cached by inputs so revisiting a combination is instant.
+  eq_all <- reactive({
+    tab  <- cejst_summary()
+    req(tab, nrow(tab) > 0)
+    mode <- input$cejst_mode %||% "Prevalence"
+    inds <- cejst_ind_cols()
+    inds <- inds[inds == "rurality" | inds %in% names(tab)]
+    res  <- dplyr::bind_rows(lapply(inds, function(v) eq_fit(tab, v, mode)))
+    req(nrow(res) > 0)
+    res$q_unadj <- stats::p.adjust(res$p_unadj, method = "BH")   # BH across indicators
+    res$q_adj   <- stats::p.adjust(res$p_adj,   method = "BH")
+    res
+  }) %>%
+    bindCache(input$cejst_mode, input$cejst_month, input$cejst_src, input$rurality)
+  
+  # Rows shown in the overview plot
+  eq_forest_df <- reactive({
+    res  <- eq_all()
+    mode <- input$cejst_mode %||% "Prevalence"
+    sc   <- if (identical(mode, "Prevalence")) function(x) log(pmax(x, 1e-6)) else function(x) x
+    res  <- res[order(-abs(sc(res$effect_adj))), , drop = FALSE]
+    if (!isTRUE(input$cejst_forest_all)) res <- utils::head(res, 20)
+    res <- res[order(sc(res$effect_adj)), , drop = FALSE]
+    res$ypos <- seq_len(nrow(res))
+    res$lab  <- vapply(
+      ifelse(res$indicator == "rurality", "Rurality (rural vs urban)", res$indicator),
+      function(s) paste(strwrap(s, 38), collapse = "\n"), character(1)
     )
-  }, {
-    var <- input$cejst_var_box
-    req(var)
+    res$sel <- res$indicator == input$cejst_var_box
+    res$sig <- !is.na(res$q_adj) & res$q_adj < 0.05
+    res
+  })
+  
+  output$cejst_forest <- renderPlot({
+    df   <- eq_forest_df()
+    mode <- input$cejst_mode %||% "Prevalence"
+    mlab <- month_labels[input$cejst_month]
     
-    # If rurality, slider is irrelevant (hidden), but we'll pin it safely anyway
-    if (identical(var, "rurality")) {
-      updateSliderInput(
-        session, "cejst_nbins",
-        min   = 2,
-        max   = 2,
-        value = 2
-      )
-      return()
+    p <- ggplot(df, aes(x = effect_adj, y = ypos)) +
+      geom_vline(xintercept = if (identical(mode, "Prevalence")) 1 else 0, colour = "#6b7280", linewidth = 0.4) +
+      geom_linerange(aes(xmin = lo_adj, xmax = hi_adj, colour = sel), orientation = "y", linewidth = 0.7) +
+      geom_point(aes(colour = sel, shape = sig), size = 3, stroke = 1) +
+      scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1), drop = FALSE, name = NULL,
+                         labels = c(`TRUE` = "q < 0.05", `FALSE` = "q ≥ 0.05")) +
+      scale_colour_manual(values = c(`TRUE` = "#e07b39", `FALSE` = "#2a78d6"), guide = "none") +
+      scale_y_continuous(breaks = df$ypos, labels = df$lab, expand = expansion(add = 0.7)) +
+      labs(
+        x = if (identical(mode, "Prevalence")) "Adjusted odds ratio of any wastewater impact (log scale)"
+        else "Adjusted rank correlation (rho) with %WW among impacted tracts",
+        y = NULL,
+        title = paste0(mode, " (", mlab, "): effect of each indicator after accounting for drainage area")
+      ) +
+      theme_app() +
+      theme(legend.position = "bottom",
+            axis.text.y = element_text(size = 11, face = "plain"),
+            axis.text.x = element_text(size = 12, face = "plain"))
+    if (identical(mode, "Prevalence")) p <- p + scale_x_log10()
+    p
+  }, height = function() if (isTRUE(input$cejst_forest_all)) 1150 else 640)
+  
+  # click a row -> select that indicator
+  observeEvent(input$cejst_forest_click, {
+    df <- eq_forest_df()
+    i  <- round(input$cejst_forest_click$y)
+    if (length(i) != 1 || is.na(i) || i < 1 || i > nrow(df)) return()
+    updateSelectInput(session, "cejst_var_box", selected = df$indicator[i])
+  })
+  
+  # headline card for the selected indicator
+  output$cejst_card <- renderUI({
+    var  <- input$cejst_var_box; req(var)
+    mode <- input$cejst_mode %||% "Prevalence"
+    res  <- eq_all()
+    r    <- res[res$indicator == var, , drop = FALSE]
+    box  <- "border:1px solid #b8bdc4; border-radius:6px; padding:12px 14px; margin-bottom:12px; background:#fff;"
+    
+    if (nrow(r) != 1) {
+      return(tags$div(style = box, "Effect size not available for this selection ",
+                      "(needs at least 50 tracts, 15 counties, and variation in the indicator)."))
     }
     
-    tab <- cejst_summary()
-    req(tab)
-    req("metric_value" %in% names(tab))
-    req(var %in% names(tab))
+    f   <- function(x) formatC(x, format = "f", digits = 2)
+    fq  <- function(x) formatC(x, format = "e", digits = 1)
+    dir <- function(x) if (identical(mode, "Prevalence")) log(x) else x
+    dir_a <- dir(r$effect_adj); dir_u <- dir(r$effect_unadj)
+    sig_a <- !is.na(r$q_adj) && r$q_adj < 0.05
+    sig_u <- !is.na(r$q_unadj) && r$q_unadj < 0.05
     
-    # Same numeric-filtering logic as cejst_binned()
-    df <- tab %>%
-      dplyr::transmute(
-        GEOID,
-        metric_value,
-        var_value = suppressWarnings(as.numeric(.data[[var]]))
-      ) %>%
-      dplyr::filter(
-        is.finite(metric_value),
-        is.finite(var_value)
-      )
+    badge <- if (sig_a && sign(dir_a) == sign(dir_u)) {
+      list("Holds after adjusting for drainage area", "#2a78d6")
+    } else if (sig_a) {
+      list("Direction reverses after adjusting for drainage area", "#e07b39")
+    } else if (sig_u) {
+      list("Largely explained by drainage area", "#6b7280")
+    } else {
+      list("No clear association", "#6b7280")
+    }
     
-    if (!nrow(df)) return()
+    is_bin <- identical(r$type, "yes/no")
+    ci_a <- sprintf("95%% CI %s to %s", f(r$lo_adj), f(r$hi_adj))
     
-    # Helper: compute the largest k (<= 6) that yields k DISTINCT labels
-    max_feasible_bins <- function(v) {
-      n_uniq <- dplyr::n_distinct(v)
-      if (n_uniq <= 1) return(1L)
-      
-      max_try <- min(6L, n_uniq)
-      
-      for (k in seq(from = max_try, to = 2L, by = -1L)) {
-        df_k <- tibble::tibble(var_value = v) %>%
-          dplyr::mutate(
-            .r      = dplyr::dense_rank(var_value),
-            .bin_id = dplyr::ntile(.r, k)
-          )
-        
-        lab_tbl <- df_k %>%
-          dplyr::group_by(.bin_id) %>%
-          dplyr::summarise(
-            lo = min(var_value, na.rm = TRUE),
-            hi = max(var_value, na.rm = TRUE),
-            .groups = "drop"
-          ) %>%
-          dplyr::arrange(.bin_id)
-        
-        # Key based on numeric range only; rounding to avoid floating slop
-        key <- paste0(round(lab_tbl$lo, 6), "_", round(lab_tbl$hi, 6))
-        
-        if (dplyr::n_distinct(key) == k) {
-          return(k)
-        }
+    sentence <- if (identical(mode, "Prevalence")) {
+      if (identical(var, "rurality")) {
+        sprintf("Rural tracts have %s times the odds of containing any wastewater-impacted segment compared with urban tracts (adjusted OR, %s).", f(r$effect_adj), ci_a)
+      } else if (is_bin) {
+        sprintf("Tracts where '%s' is Yes have %s times the odds of containing any wastewater-impacted segment compared with tracts where it is No (adjusted OR, %s).", var, f(r$effect_adj), ci_a)
+      } else {
+        sprintf("A 1 SD higher '%s' goes with %s times the odds that a tract contains any wastewater-impacted segment (adjusted OR, %s).", var, f(r$effect_adj), ci_a)
       }
-      
-      1L
+    } else {
+      hi_lo <- if (r$effect_adj > 0) "higher" else "lower"
+      if (identical(var, "rurality")) {
+        sprintf("Among impacted tracts, rural tracts tend to have %s %%WW than urban tracts (adjusted rank correlation rho = %s, %s).", hi_lo, f(r$effect_adj), ci_a)
+      } else if (is_bin) {
+        sprintf("Among impacted tracts, tracts where '%s' is Yes tend to have %s %%WW than tracts where it is No (adjusted rank correlation rho = %s, %s).", var, hi_lo, f(r$effect_adj), ci_a)
+      } else {
+        sprintf("Among impacted tracts, higher '%s' tends to go with %s %%WW (adjusted rank correlation rho = %s, %s).", var, hi_lo, f(r$effect_adj), ci_a)
+      }
     }
     
-    mx_eff <- max_feasible_bins(df$var_value)
-    mx     <- max(2L, min(6L, as.integer(mx_eff)))
-    
-    updateSliderInput(
-      session,
-      "cejst_nbins",
-      min   = 2,
-      max   = mx,
-      value = mx  # default to the *largest* feasible number of bins
+    nm <- if (identical(mode, "Prevalence")) "OR" else "rho"
+    tags$div(
+      style = box,
+      tags$span(
+        style = paste0("display:inline-block; background:", badge[[2]], "; color:#fff; font-weight:bold; ",
+                       "padding:3px 10px; border-radius:12px; margin-bottom:8px;"),
+        badge[[1]]
+      ),
+      tags$p(style = "margin:6px 0;", sentence),
+      tags$p(
+        style = "margin:4px 0; color:#555; font-size:90%;",
+        sprintf("Adjusted BH q = %s.  Unadjusted %s = %s (95%% CI %s to %s), BH q = %s.  n = %d tracts in %d counties.",
+                fq(r$q_adj), nm, f(r$effect_unadj), f(r$lo_unadj), f(r$hi_unadj), fq(r$q_unadj),
+                r$n_tracts, r$n_counties)
+      ),
+      if (identical(mode, "Prevalence"))
+        tags$p(style = "margin:4px 0; color:#555; font-size:90%;",
+               tags$em("Prevalence is descriptive: it depends heavily on tract size and how many streams cross the tract."))
     )
-  }, ignoreInit = FALSE)
+  })
   
   # ---- Plotting: Prevalence / Severity ---------------------------------
   output$cejst_plot <- renderPlot({
-    df <- cejst_binned()
-    req(df)
-    df$var_bin <- droplevels(df$var_bin)
-    
-    var  <- input$cejst_var_box
+    var  <- input$cejst_var_box; req(var)
+    mode <- input$cejst_mode %||% "Prevalence"
     mlab <- month_labels[input$cejst_month]
     
-    mode <- input$cejst_mode %||% "Prevalence"
+    r <- tryCatch({ res <- eq_all(); res[res$indicator == var, , drop = FALSE] }, error = function(e) NULL)
+    stat_line <- eq_stat_line(r, mode)
     
-    if (identical(mode, "Prevalence")) {
+    # ---------------- yes/no and Rurality ----------------
+    if (is_cat_var(var)) {
+      df <- cejst_cat_df()
+      req(df, nrow(df) > 0)
       
-      prev_sum <- df %>%
-        dplyr::group_by(var_bin) %>%
-        dplyr::summarise(
-          n    = dplyr::n(),
-          k    = sum(metric_value == 1, na.rm = TRUE),
-          prop = ifelse(n > 0, k / n, NA_real_),
-          .groups = "drop"
-        )
-      
-      z <- stats::qnorm(0.975)
-      
-      prev_sum <- prev_sum %>%
-        dplyr::mutate(
-          denom  = 1 + z^2 / n,
-          center = (prop + z^2 / (2 * n)) / denom,
-          half   = (z * sqrt((prop * (1 - prop) / n) + (z^2 / (4 * n^2)))) / denom,
-          lo     = pmax(0, center - half),
-          hi     = pmin(1, center + half)
-        )
-      
-      title_txt <- paste0(
-        "Prevalence by ",
-        ifelse(identical(var, "rurality"), "Rurality", var),
-        " (", mlab, "; prevalence uses WW>0 and is denominator-independent)"
-      )
-      
-      ggplot(prev_sum, aes(x = var_bin, y = prop, fill = var_bin)) +
-        geom_col(width = 0.75, color = "white", linewidth = 0.2) +
-        geom_text(
-          aes(label = paste0(round(100 * prop, 1), "% (", k, "/", n, ")")),
-          vjust = -0.4,
-          size = 4.2,
-          fontface = "bold"
-        ) +
-        {
-          if (identical(var, "rurality")) {
-            scale_fill_manual(values = rurality_colors, drop = FALSE)
-          } else {
-            scale_fill_viridis_d(option = "C", end = 0.9)
-          }
-        } +
-        labs(
-          x = if (identical(var, "rurality")) "Rurality category" else paste0("Bins of ", var),
-          y = "Share of tracts with any wastewater-impacted segment",
-          title = title_txt
-        ) +
-        theme_app() +
-        theme(
-          axis.text.x = element_text(
-            angle = if (identical(var, "rurality")) 0 else 25,
-            hjust = if (identical(var, "rurality")) 0.5 else 1
-          )
-        )
-      
-    } else {
-      
-      src       <- input$cejst_src %||% "Gage-based"
-      denom_lab <- ifelse(src == "Gage-based", "gage-based", "NHDPlus-based")
-      
-      ymax <- max(df$metric_value, na.rm = TRUE)
-      
-      sev_sum <- df %>%
-        dplyr::group_by(var_bin) %>%
-        dplyr::summarise(
-          n   = dplyr::n(),
-          med = stats::median(metric_value, na.rm = TRUE),
-          mx  = max(metric_value, na.rm = TRUE),
-          .groups = "drop"
-        ) %>%
-        dplyr::mutate(
-          y_lab = pmin(mx + 0.06 * ymax, ymax * 1.08),
-          label = paste0("Median: ", round(med, 1), "%\n(n=", n, ")")
-        )
-      
-      ggplot(df, aes(x = var_bin, y = metric_value, fill = var_bin)) +
-        geom_boxplot(outlier.alpha = 0.5) +
-        geom_text(
-          data = sev_sum,
-          aes(x = var_bin, y = y_lab, label = label),
-          inherit.aes = FALSE,
-          size = 4.2,
-          fontface = "bold"
-        ) +
-        {
-          if (identical(var, "rurality")) {
-            scale_fill_manual(values = rurality_colors, drop = FALSE)
-          } else {
-            scale_fill_viridis_d(option = "C", end = 0.9)
-          }
-        } +
-        coord_cartesian(ylim = c(0, ymax * 1.12)) +
-        labs(
-          x = if (identical(var, "rurality")) "Rurality category" else paste0("Bins of ", var),
-          y = "Severity: %WW among impacted segments",
-          title = paste0(
-            "Severity by ",
-            ifelse(identical(var, "rurality"), "Rurality", var),
-            " (", mlab, ", ", denom_lab, " denominator)"
-          )
-        ) +
-        theme_app() +
-        theme(
-          axis.text.x = element_text(
-            angle = if (identical(var, "rurality")) 0 else 25,
-            hjust = if (identical(var, "rurality")) 0.5 else 1
-          )
-        )
-    }
-  })
-  
-  output$cejst_stats <- renderPrint({
-    df <- cejst_binned()
-    req(df)
-    df$var_bin <- droplevels(df$var_bin)
-    
-    if (length(levels(df$var_bin)) < 2) {
-      cat("Only one bin contains data; cannot compare bins statistically.\n")
-      return(invisible(NULL))
-    }
-    
-    cat("Tracts per bin:\n")
-    print(table(df$var_bin))
-    cat("\n")
-    
-    if (identical(input$cejst_mode, "Prevalence")) {
-      
-      # ---------- PREVALENCE STATS ----------
-      tab <- table(df$var_bin, df$metric_value)
-      cat("Contingency table (bin x any_impacted 0/1):\n")
-      print(tab)
-      cat("\n")
-      
-      chi <- try(suppressWarnings(chisq.test(tab)), silent = TRUE)
-      if (!inherits(chi, "try-error")) {
-        cat("Chi-squared test (overall differences in prevalence across bins):\n")
-        cat(sprintf(
-          "  X-squared = %.3f, df = %d, p-value = %.3e\n\n",
-          unname(chi$statistic),
-          unname(chi$parameter),
-          chi$p.value
-        ))
+      grp_cols <- if (identical(var, "rurality")) {
+        rurality_colors
       } else {
-        cat("Could not compute chi-squared test.\n\n")
+        c(No = "#8a8f98", Yes = "#E07B39")
       }
+      x_lab <- if (identical(var, "rurality")) "Rurality category" else var
+      ttl   <- ifelse(identical(var, "rurality"), "Rurality", var)
       
-      prev_sum <- df %>%
-        dplyr::group_by(var_bin) %>%
-        dplyr::summarise(
-          n    = dplyr::n(),
-          k    = sum(metric_value == 1, na.rm = TRUE),
-          prop = k / n,
-          .groups = "drop"
-        )
-      
-      cat("Prevalence by bin (k/n):\n")
-      print(prev_sum)
-      cat("\n")
-      
-      bins <- as.character(prev_sum$var_bin)
-      if (length(bins) >= 2) {
-        pairs <- combn(bins, 2, simplify = FALSE)
-        pw <- lapply(pairs, function(p) {
-          a <- prev_sum[prev_sum$var_bin == p[1], ]
-          b <- prev_sum[prev_sum$var_bin == p[2], ]
-          tt <- prop.test(
-            x = c(a$k, b$k),
-            n = c(a$n, b$n),
-            correct = FALSE
-          )
-          data.frame(
-            bin1      = p[1],
-            bin2      = p[2],
-            p_value   = tt$p.value,
-            diff_prop = (a$k / a$n) - (b$k / b$n),
-            stringsAsFactors = FALSE
-          )
-        })
-        pw <- dplyr::bind_rows(pw)
-        pw$p_adj_BH <- p.adjust(pw$p_value, method = "BH")
-        
-        cat("Pairwise proportion tests (BH-adjusted):\n")
-        pw_print <- pw %>%
+      if (identical(mode, "Prevalence")) {
+        z <- stats::qnorm(0.975)
+        prev_sum <- df %>%
+          dplyr::group_by(grp) %>%
+          dplyr::summarise(n = dplyr::n(), k = sum(metric_value == 1, na.rm = TRUE), .groups = "drop") %>%
           dplyr::mutate(
-            p_value  = formatC(p_value,  format = "e", digits = 2),
-            p_adj_BH = formatC(p_adj_BH, format = "e", digits = 2),
-            diff_prop = round(diff_prop, 3)
+            prop   = k / n,
+            denom  = 1 + z^2 / n,
+            center = (prop + z^2 / (2 * n)) / denom,
+            half   = (z * sqrt((prop * (1 - prop) / n) + (z^2 / (4 * n^2)))) / denom,
+            lo     = pmax(0, center - half),
+            hi     = pmin(1, center + half)
           )
-        print(pw_print, row.names = FALSE)
-      }
-      
-      cat("\nNotes:\n")
-      cat("  Prevalence is tract-level: 1 if ANY intersecting segment has WW flow > 0, else 0.\n")
-      cat("  Plot shows % of tracts impacted per bin.\n")
-      cat("  Denominator selection does not affect prevalence (it only affects severity).\n")
-      
-    } else {
-      
-      # ---------- SEVERITY STATS ----------
-      kw <- try(stats::kruskal.test(metric_value ~ var_bin, data = df), silent = TRUE)
-      if (inherits(kw, "try-error")) {
-        cat("Could not compute Kruskal–Wallis test.\n")
-        return(invisible(NULL))
-      }
-      
-      cat("Kruskal–Wallis test for differences between bins:\n")
-      cat(sprintf(
-        "  chi-squared = %.3f, df = %d, p-value = %.3e\n\n",
-        kw$statistic,
-        kw$parameter,
-        kw$p.value
-      ))
-      
-      if (kw$p.value < 0.05) {
-        cat("Pairwise comparisons (Wilcoxon, BH-adjusted p-values):\n\n")
-        pw <- try(
-          stats::pairwise.wilcox.test(df$metric_value, df$var_bin, p.adjust.method = "BH"),
-          silent = TRUE
-        )
-        if (!inherits(pw, "try-error")) {
-          pmat     <- pw$p.value
-          fmt_pmat <- pmat
-          if (!is.null(pmat)) {
-            fmt_pmat[] <- ifelse(
-              is.na(pmat),
-              NA,
-              formatC(pmat, format = "e", digits = 2)
-            )
-          }
-          print(fmt_pmat, quote = FALSE)
-        } else {
-          cat("  Could not compute pairwise Wilcoxon tests.\n")
-        }
+        
+        ggplot(prev_sum, aes(x = grp, y = prop, colour = grp)) +
+          geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 1.4) +
+          geom_point(size = 5) +
+          geom_text(
+            aes(y = hi, label = paste0(round(100 * prop, 1), "%  (", k, " of ", n, " tracts)")),
+            vjust = -0.9, size = 4.4, fontface = "bold", colour = "#1f2328"
+          ) +
+          scale_colour_manual(values = grp_cols, drop = FALSE) +
+          scale_y_continuous(labels = scales::percent, limits = c(0, NA), expand = expansion(mult = c(0.02, 0.18))) +
+          labs(
+            x = x_lab,
+            y = "Share of tracts with any wastewater-impacted segment",
+            title = paste0("Prevalence by ", ttl, " (", mlab, ")"),
+            subtitle = stat_line,
+            caption = "Dots: share of tracts impacted. Bars: 95% confidence interval (Wilson)."
+          ) +
+          theme_app()
+        
       } else {
-        cat("Result: p ≥ 0.05 → no strong evidence bins differ.\n")
+        src       <- input$cejst_src %||% "Gage-based"
+        denom_lab <- ifelse(src == "Gage-based", "gage-based", "NHDPlus-based")
+        df <- dplyr::filter(df, metric_value > 0)
+        req(nrow(df) > 0)
+        
+        sev_sum <- df %>%
+          dplyr::group_by(grp) %>%
+          dplyr::summarise(n = dplyr::n(), med = stats::median(metric_value, na.rm = TRUE),
+                           top = max(metric_value, na.rm = TRUE), .groups = "drop") %>%
+          dplyr::mutate(label = paste0("Median ", signif(med, 2), "%\n(n = ", n, ")"))
+        
+        ggplot(df, aes(x = grp, y = metric_value)) +
+          geom_jitter(aes(colour = grp), width = 0.18, height = 0, alpha = 0.3, size = 1.4) +
+          geom_boxplot(aes(fill = grp), width = 0.38, outlier.shape = NA, alpha = 0.55,
+                       colour = "#1f2328", linewidth = 0.6) +
+          geom_text(data = sev_sum, aes(x = grp, y = top, label = label),
+                    inherit.aes = FALSE, vjust = -0.4, size = 4.2, fontface = "bold", colour = "#1f2328") +
+          scale_colour_manual(values = grp_cols, drop = FALSE) +
+          scale_fill_manual(values = grp_cols, drop = FALSE) +
+          scale_y_log10(labels = scales::label_number(suffix = "%", drop0trailing = TRUE),
+                        expand = expansion(mult = c(0.05, 0.2))) +
+          labs(
+            x = x_lab,
+            y = "Severity: median %WW among impacted segments (log scale)",
+            title = paste0("Severity by ", ttl, " (", mlab, ", ", denom_lab, " denominator)"),
+            subtitle = stat_line,
+            caption = "Each point is a tract. Box: median and middle 50% of tracts."
+          ) +
+          theme_app()
+      }
+    } else {
+      # ---------------- numeric indicator: summary at each distinct value (no smoothing) ----------------
+      tab <- cejst_summary()
+      req(tab, var %in% names(tab))
+      df <- tab %>%
+        dplyr::transmute(GEOID, metric_value, x = suppressWarnings(as.numeric(.data[[var]]))) %>%
+        dplyr::filter(is.finite(metric_value), is.finite(x))
+      req(nrow(df) > 0)
+      
+      # One group per distinct value; with more than 15 distinct values, use tenths
+      n_uniq    <- dplyr::n_distinct(df$x)
+      use_vals  <- n_uniq <= 15
+      df$g      <- if (use_vals) df$x else stats::ave(df$x, dplyr::ntile(df$x, 10), FUN = mean)
+      grp_note  <- if (use_vals) "One summary per distinct value of the indicator." else "Summaries for tenths of the indicator (equal numbers of tracts in each)."
+      size_note <- if (use_vals) " Dot size = number of tracts." else ""
+      wrap_cap  <- function(s) paste(strwrap(s, 100), collapse = "\n")
+      
+      # dot layers: size shows tract count only when the groups are distinct values
+      pt_layers <- function(colour, data, ycol) {
+        if (use_vals) {
+          list(
+            geom_point(data = data, aes(x = g, y = .data[[ycol]], size = n), colour = colour),
+            scale_size_area(max_size = 7, name = "Tracts at this value",
+                            breaks = function(lims) unique(round(pretty(lims, n = 4))),
+                            labels = scales::label_comma(accuracy = 1))
+          )
+        } else {
+          list(geom_point(data = data, aes(x = g, y = .data[[ycol]]),
+                          colour = colour, size = 3.5))
+        }
       }
       
-      cat("\nNotes:\n")
-      cat("  Severity uses %WW for the chosen denominator and is conditional on %WW > 0 (impacted segments only).\n")
-      
+      if (identical(mode, "Prevalence")) {
+        z <- stats::qnorm(0.975)
+        sm <- df %>%
+          dplyr::group_by(g) %>%
+          dplyr::summarise(n = dplyr::n(), k = sum(metric_value == 1), .groups = "drop") %>%
+          dplyr::mutate(
+            prop   = k / n,
+            denom  = 1 + z^2 / n,
+            center = (prop + z^2 / (2 * n)) / denom,
+            half   = (z * sqrt((prop * (1 - prop) / n) + (z^2 / (4 * n^2)))) / denom,
+            lo     = pmax(0, center - half),
+            hi     = pmin(1, center + half)
+          )
+        
+        ggplot(sm, aes(x = g, y = prop)) +
+          geom_linerange(aes(ymin = lo, ymax = hi), colour = "#2a78d6", linewidth = 1) +
+          pt_layers("#2a78d6", sm, "prop") +
+          scale_y_continuous(labels = scales::percent) +
+          coord_cartesian(ylim = c(0, 1)) +
+          labs(
+            x = var,
+            y = "Share of tracts with any wastewater-impacted segment",
+            title = paste0("Prevalence vs ", var, " (", mlab, ")"),
+            subtitle = stat_line,
+            caption = wrap_cap(paste0("Dot: share of tracts impacted; bar: 95% CI (Wilson).", size_note, " ",
+                                      grp_note, " Raw values; the effect size in the subtitle is adjusted for drainage area."))
+          ) +
+          theme_app() +
+          theme(legend.position = "bottom")
+        
+      } else {
+        src       <- input$cejst_src %||% "Gage-based"
+        denom_lab <- ifelse(src == "Gage-based", "gage-based", "NHDPlus-based")
+        df <- dplyr::filter(df, metric_value > 0)
+        req(nrow(df) > 0)
+        
+        sm <- df %>%
+          dplyr::group_by(g) %>%
+          dplyr::summarise(
+            n   = dplyr::n(),
+            med = stats::median(metric_value),
+            q1  = stats::quantile(metric_value, 0.25, names = FALSE),
+            q3  = stats::quantile(metric_value, 0.75, names = FALSE),
+            .groups = "drop"
+          )
+        
+        # faint points: at the real value (tenths mode) or spread slightly sideways (distinct-value mode)
+        df$xp <- if (use_vals) df$g else df$x
+        ug <- sort(unique(sm$g))
+        jw <- if (!use_vals) 0 else if (length(ug) > 1) 0.25 * min(diff(ug)) else 0.1
+        
+        ggplot() +
+          geom_jitter(data = df, aes(x = xp, y = metric_value), width = jw, height = 0,
+                      alpha = 0.2, size = 1.2, colour = "#6b7280") +
+          geom_linerange(data = sm, aes(x = g, ymin = q1, ymax = q3), colour = "#2a78d6", linewidth = 1.2) +
+          pt_layers("#2a78d6", sm, "med") +
+          scale_y_log10(labels = scales::label_number(suffix = "%", drop0trailing = TRUE)) +
+          labs(
+            x = var,
+            y = "Severity: median %WW among impacted segments (log scale)",
+            title = paste0("Severity vs ", var, " (", mlab, ", ", denom_lab, " denominator)"),
+            subtitle = stat_line,
+            caption = wrap_cap(paste0("Faint points: individual tracts. Dot: median; bar: middle 50% of tracts.", size_note, " ",
+                                      grp_note, " Raw values; the effect size in the subtitle is adjusted for drainage area."))
+          ) +
+          theme_app() +
+          theme(legend.position = "bottom")
+      }
     }
   })
   
-  # ---- Download: Equity data (tract-level values + bins) --------------------
+  # ---- Download: Equity data (tract-level values) ----------------------------
   output$download_cejst_data <- downloadHandler(
     filename = function() {
       paste0("ReSourceTracker_equity_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      df <- cejst_binned()
-      req(df)
+      tab <- cejst_summary()
+      req(tab)
+      var <- input$cejst_var_box %||% NA_character_
       
       mode_now    <- input$cejst_mode %||% "Prevalence"
       denom_now   <- if (identical(mode_now, "Severity")) (input$cejst_src %||% "Gage-based") else NA_character_
       month_code  <- input$cejst_month
       month_label <- month_labels[month_code]
-      rural_filt  <- input$rurality %||% "All"
-      var_name    <- input$cejst_var_box %||% NA_character_
       
-      df_out <- df %>%
-        mutate(
-          analysis_mode      = mode_now,        # "Prevalence" or "Severity"
-          denominator_source = denom_now,       # only meaningful for Severity
+      df_out <- tab %>%
+        dplyr::mutate(
+          analysis_mode      = mode_now,
+          denominator_source = denom_now,
           month_code         = month_code,
           month_label        = unname(month_label),
-          cejst_variable     = var_name,        # e.g., "rurality" or a CEJST metric
-          rurality_filter    = rural_filt
+          cejst_variable     = var,
+          indicator_value    = if (!is.na(var) && var %in% names(tab)) .data[[var]] else NA,
+          rurality_filter    = input$rurality %||% "All"
         ) %>%
-        # put metadata columns first
-        select(
-          analysis_mode, denominator_source,
-          month_code, month_label,
-          cejst_variable, rurality_filter,
-          GEOID, var_bin, metric_value,
-          everything()
+        dplyr::select(
+          analysis_mode, denominator_source, month_code, month_label,
+          cejst_variable, rurality_filter, GEOID, indicator_value, metric_value,
+          dplyr::everything()
         )
       
       readr::write_csv(df_out, file)
     }
   )
-  # Only compute these outputs when their tabs are visible
-  outputOptions(output, "cejst_plot",          suspendWhenHidden = TRUE)
-  outputOptions(output, "cejst_stats",         suspendWhenHidden = TRUE)
-  outputOptions(output, "season_plot_median",  suspendWhenHidden = TRUE)
-  outputOptions(output, "season_text",         suspendWhenHidden = TRUE)
-  outputOptions(output, "season_stats_text",   suspendWhenHidden = TRUE)
+  
+  # ---- Census tract info panel (Map tab) ------------------------------------
+  output$tract_info <- renderPrint({
+    gid <- selected_tract_id()
+    if (is.null(gid)) {
+      cat("Click a census tract polygon to see \ntract-level wastewater metrics here.\n")
+      return(invisible(NULL))
+    }
+    
+    tr_row <- tracts_info[tracts_info$GEOID == gid, , drop = FALSE]
+    if (nrow(tr_row) == 0) {
+      cat("Selected tract not found in tract table.\n")
+      return(invisible(NULL))
+    }
+    
+    # Month and denominator currently selected on the Map tab
+    m   <- input$month %||% "06"
+    src <- input$src   %||% "Gage-based"
+    
+    pct_col <- if (identical(src, "Gage-based")) {
+      paste0("pct_mean_", m)
+    } else {
+      paste0("pct_mean_", m, "_nhd")
+    }
+    ww_col <- paste0("WW_cum_mean_", m)
+    
+    seg <- fl_cejst %>%
+      dplyr::filter(GEOID == gid)
+    
+    if (!nrow(seg)) {
+      cat("No stream segments intersect this tract.\n")
+      return(invisible(NULL))
+    }
+    
+    if (!all(c(pct_col, ww_col) %in% names(seg))) {
+      cat("Missing wastewater columns for this month / denominator.\n")
+      return(invisible(NULL))
+    }
+    
+    seg <- seg %>%
+      dplyr::mutate(
+        pct = suppressWarnings(as.numeric(.data[[pct_col]])),
+        ww  = suppressWarnings(as.numeric(.data[[ww_col]])),
+        impacted = is.finite(ww) & ww > 0
+      )
+    
+    n_seg_total <- nrow(seg)
+    n_imp       <- sum(seg$impacted, na.rm = TRUE)
+    prevalence  <- n_imp > 0
+    
+    # Severity: %WW among impacted segments
+    seg_imp <- seg %>% dplyr::filter(impacted, is.finite(pct))
+    if (nrow(seg_imp) > 0) {
+      sev_med <- stats::median(seg_imp$pct, na.rm = TRUE)
+      sev_p90 <- stats::quantile(seg_imp$pct, 0.9, na.rm = TRUE)
+      sev_max <- max(seg_imp$pct, na.rm = TRUE)
+    }
+    
+    cat("Census tract:", gid, "\n")
+    cat("Rurality:    ", tr_row$rurality[1] %||% "NA", "\n")
+    cat("Low income?: ", ifelse(isTRUE(tr_row$low_income[1]), "Yes",
+                                ifelse(isFALSE(tr_row$low_income[1]), "No", "NA")), "\n")
+    
+    cat("\nMonth:        ", month_labels[m], "\n")
+    cat("Denominator:  ", ifelse(identical(src, "Gage-based"),
+                                 "Gage-based streamflow",
+                                 "NHDPlus-based streamflow"), "\n\n")
+    
+    cat("Segments intersecting tract: ", n_seg_total, "\n")
+    cat("Segments with WW>0 (impacted): ", n_imp, "\n")
+    cat("Prevalence this month: ",
+        ifelse(prevalence, "Impacted", "Not impacted"),
+        "\n\n")
+    
+    if (nrow(seg_imp) == 0) {
+      cat("No impacted segments to compute severity (%WW) \nfor this tract.\n")
+    } else {
+      cat("Severity among impacted segments (", nrow(seg_imp), " segments):\n", sep = "")
+      cat("  Median %WW: ", round(sev_med, 1), "%\n", sep = "")
+      cat("  90th pct %WW: ", round(sev_p90, 1), "%\n", sep = "")
+      cat("  Max %WW: ", round(sev_max, 1), "%\n", sep = "")
+    }
+  })
 }
 
 # --- Launch App -------------------------------------------------------------
 shinyApp(ui = ui, server = server)
-
