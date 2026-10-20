@@ -33,6 +33,24 @@ dwtp_map    <- read_app("dwtp_map_app")
 wwtp_map    <- read_app("wwtp_map_app")
 gages_map   <- read_app("gages_map_app")
 
+# --- Trim map layers to keep memory low ---------------------------------------
+# The browser map can't handle all ~67k segments with popups (it ran the
+# server out of memory), so the map draws only segments that carry wastewater
+# (%WW > 0) in at least one month, for either denominator.
+map_bounds <- sf::st_sf(geometry = sf::st_as_sfc(sf::st_bbox(flowlines)))  # statewide view
+
+pct_cols_all <- intersect(
+  c(paste0("pct_mean_", sprintf("%02d", 1:12)), paste0("pct_mean_", sprintf("%02d", 1:12), "_nhd")),
+  names(flowlines)
+)
+pct_mat   <- as.matrix(sf::st_drop_geometry(flowlines)[, pct_cols_all])
+flowlines <- flowlines[rowSums(is.finite(pct_mat) & pct_mat > 0) > 0, ]
+rm(pct_mat)
+
+# Full-resolution tract outlines are ~20 MB of map data; 100 m simplification
+# is invisible at map scale and cuts that by more than 90%.
+tracts_map <- sf::st_simplify(tracts_map, dTolerance = 100, preserveTopology = TRUE)
+
 # --- Constants ---------------------------------------------------------------
 mon_codes    <- sprintf("%02d", 1:12)            # "01"–"12"
 month_labels <- setNames(month.name, mon_codes)  # "01" -> "January"
@@ -732,8 +750,12 @@ server <- function(input, output, session) {
     m    <- input$month
     mlab <- month_labels[m]
     
+    # Draw only segments with wastewater this month for this denominator
+    vals_all <- dat[[spec$pct]]
+    dat      <- dat[is.finite(vals_all) & vals_all > 0, ]
+    
     vals     <- dat[[spec$pct]]
-    ww_color <- ifelse(is.na(vals), "#d9d9d9", pal(vals))
+    ww_color <- pal(vals)
     
     if (input$src == "Gage-based") {
       ww_mean_col <- paste0("WW_cum_mean_", m)
@@ -818,9 +840,7 @@ server <- function(input, output, session) {
        USGS gage
      </div>
      <div style='margin-top:4px;'>
-       <span style='display:inline-block; width:20px; height:3px;
-                    background:#d9d9d9; margin-right:6px;'></span>
-       Stream with no %WW data
+       Only stream segments with wastewater (%WW &gt; 0) are shown.
      </div>
    </div>"
   
@@ -829,7 +849,7 @@ server <- function(input, output, session) {
     mapgl::maplibre(
       style = mapgl::openfreemap_style("positron")
     ) %>%
-      mapgl::fit_bounds(flowlines, animate = FALSE) %>%
+      mapgl::fit_bounds(map_bounds, animate = FALSE) %>%
       mapgl::add_navigation_control(position = "top-right") %>%
       mapgl::add_scale_control(position = "bottom-left") %>%
       
@@ -918,7 +938,7 @@ server <- function(input, output, session) {
   
   observeEvent(input$reset_map, {
     mapgl::maplibre_proxy("map") %>%
-      mapgl::fit_bounds(flowlines, animate = TRUE)
+      mapgl::fit_bounds(map_bounds, animate = TRUE)
   })
   
   # --- Recolor and repopulate streams when the dropdowns change ---------------
